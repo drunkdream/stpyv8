@@ -67,6 +67,8 @@ namespace py = boost::python;
 #undef FP_ZERO
 #undef FP_SUBNORMAL
 #undef FP_NORMAL
+#undef COMPILER
+#undef snprintf
 #endif
 
 #include <v8.h>
