@@ -17,6 +17,8 @@ from settings import *  # pylint:disable=wildcard-import,unused-wildcard-import
 
 log = logging.getLogger()
 
+with open('README.md', 'rb') as fp:
+    README = fp.read().decode()
 
 def exec_cmd(cmdline, *args, **kwargs):
     msg = kwargs.get("msg")
@@ -27,7 +29,7 @@ def exec_cmd(cmdline, *args, **kwargs):
         print(msg)
 
     cmdline = " ".join([cmdline] + list(args))
-
+    print(cmdline)
     proc = subprocess.Popen(
         cmdline,  # pylint:disable=consider-using-with
         shell=kwargs.get("shell", True),
@@ -95,12 +97,29 @@ def build_boost():
     args = ""
     if sys.platform == "darwin":
         args += " compiler.balcklist clang --with-toolset=clang"
-    exec_cmd("./bootstrap.sh" + args, cwd=os.path.dirname(bootstrap_path), msg="Run boost bootstrap")
-    cxxflags = f"-fPIC $(python{sys.version_info[0]}.{sys.version_info[1]}-config --includes)"
+    bootstrap = "./bootstrap.sh"
+    build_dir = os.path.dirname(bootstrap_path)
+    if sys.platform == "win32":
+        bootstrap = "bootstrap.bat"
+        build_dir = os.path.join(build_dir, "tools", "build")
+    exec_cmd(bootstrap + args, cwd=build_dir, msg="Run boost bootstrap")
+
+    b2 = "./b2"
+    cxxflags = (
+        f"-fPIC $(python{sys.version_info[0]}.{sys.version_info[1]}-config --includes)"
+    )
+
     if sys.platform == "darwin":
         cxxflags += " -stdlib=libc++"
+    elif sys.platform == "win32":
+        b2 = r"tools\build\b2"
+    cmdline = f"{b2} --with-system --with-iostreams --with-thread --with-date_time --with-python threading=multi"
+    if sys.platform != "win32":
+        cmdline += f' cxxflags="{cxxflags}"'
+    else:
+        cmdline += " toolset=msvc link=static runtime-link=static"
     exec_cmd(
-        f'./b2 --with-system --with-iostreams --with-python cxxflags="{cxxflags}" threading=multi',
+        cmdline,
         cwd=os.path.dirname(bootstrap_path),
         msg="Build boost static libraries",
     )
@@ -151,7 +170,7 @@ def checkout_v8():
 def build_v8():
     exec_cmd(
         os.path.join(DEPOT_HOME, "gn"),
-        f"gen out.gn/x64.release.sample --args='{GN_ARGS}'",
+        f'gen out.gn/x64.release.sample --args="{GN_ARGS}"',
         cwd=V8_HOME,
         msg=f"Generate build scripts for V8 (v{V8_GIT_TAG})",
     )
@@ -178,7 +197,7 @@ def prepare_v8():
         build_v8()
         # clean_stpyv8()
     except Exception as e:  # pylint:disable=broad-except
-        log.error("Fail to checkout and build v8, %s", str(e))
+        log.exception("Fail to checkout and build v8")
 
 
 class stpyv8_build_boost(build_ext):
@@ -254,6 +273,8 @@ setup(
     name="st-pyv8",
     version=STPYV8_VERSION,
     description="Python Wrapper for Google V8 Engine",
+    long_description=README,
+    long_description_content_type="text/markdown",
     platforms="x86",
     author="Philip Syme, Angelo Dell'Aera, drunkdream",
     url="https://github.com/drunkdream/stpyv8",
@@ -274,8 +295,6 @@ setup(
         "Topic :: Software Development",
         "Topic :: Software Development :: Libraries :: Python Modules",
         "Topic :: Utilities",
-        "Operating System :: POSIX :: Linux",
-        "Operating System :: MacOS :: MacOS X",
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3.6",
         "Programming Language :: Python :: 3.7",

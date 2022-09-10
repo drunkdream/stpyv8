@@ -63,11 +63,11 @@ source_files = [
 
 
 macros = [("BOOST_PYTHON_STATIC_LIB", None)]
-include_dirs = []
-library_dirs = []
+include_dirs = [BOOST_ROOT]
+library_dirs = [os.path.join(BOOST_ROOT, "stage", "lib")]
 libraries = []
-extra_compile_args = ["-I%s" % BOOST_ROOT]
-extra_link_args = ["-L%s" % os.path.join(BOOST_ROOT, "stage", "lib")]
+extra_compile_args = []
+extra_link_args = []
 if sys.platform == "linux":
     extra_link_args += [
         "-L/usr/lib/x86_64-linux-gnu",
@@ -127,11 +127,14 @@ STPYV8_BOOST_PYTHON = os.getenv(
 )
 
 if os.name in ("nt",):
-    include_dirs += os.environ["INCLUDE"].split(";")
-    library_dirs += os.environ["LIB"].split(";")
-    libraries += ["winmm", "ws2_32"]
-    extra_compile_args += ["/O2", "/GL", "/MT", "/EHsc", "/Gy", "/Zi"]
-    extra_link_args += ["/DLL", "/OPT:REF", "/OPT:ICF", "/MACHINE:X86"]
+    os.environ["DEPOT_TOOLS_WIN_TOOLCHAIN"] = "0"
+    if os.environ.get("INCLUDE"):
+        include_dirs += os.environ["INCLUDE"].split(";")
+    if os.environ.get("LIB"):
+        library_dirs += os.environ["LIB"].split(";")
+    libraries += ["winmm", "ws2_32", "advapi32", "dbghelp", "v8_monolith"]
+    extra_compile_args += ["/O2", "/GL", "/MT", "/EHsc", "/Gy", "/Zi", "/std:c++17"]
+    extra_link_args += ["/DLL", "/OPT:REF", "/OPT:ICF", "/MACHINE:X64"]
 elif os.name in ("posix",):
     if sys.platform == "darwin":
         libraries = ["boost_system", "boost_iostreams", "v8_monolith", STPYV8_BOOST_PYTHON]

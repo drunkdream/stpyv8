@@ -95,11 +95,10 @@ Find more in the [tests](tests) directory.
 
 # Installing
 
-Installing on Linux/MacOS
+Installing on Linux/MacOS/Windows
 
-```
-Shell
-$ python3 -m pip install st-pyv8
+```bash
+python3 -m pip install st-pyv8
 ```
 
 If no wheels are provided for your platform and Python version you are required to build
@@ -114,7 +113,7 @@ code, as well as boost-python and some other boost dependencies.
 
 ### Linux
 
-```Shell
+```bash
 python_version=3.7
 echo Build with python $python_version
 
@@ -136,8 +135,21 @@ command line tools) to compile Google V8. The command line tools bundled with XC
 required (rather than the stand-alone command line tools, sometimes requiring
 [drastic measures](https://bugs.chromium.org/p/chromium/issues/detail?id=729990#c1) .)
 
-```Shell
-$ python3 setup.py bdist_wheel --plat-name macosx_10_10_x86_64
+```bash
+export PATH=/usr/local/Cellar/python@3.10/3.10.6_2/bin:$PATH
+ln -s /usr/local/Cellar/python@3.10/3.10.6_2/bin/python3 /usr/local/Cellar/python@3.10/3.10.6_2/bin/python
+# ensure default python point to the target python path
+python setup.py bdist_wheel --plat-name macosx_10_10_x86_64
+```
+
+### Windows
+
+Building on Windows requires [Microsoft's development tools](https://chromium.googlesource.com/chromium/src.git/+/HEAD/docs/windows_build_instructions.md#visual-studio) to be installed
+
+```bat
+set PATH=C:\Users\shadowyang\AppData\Local\Programs\Python\Python310;%PATH%
+:: ensure default python point to the target python path
+python setup.py bdist_wheel
 ```
 
 More detailed build instructions are in the [docs](docs/source/build.rst) folder.
