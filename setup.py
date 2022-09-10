@@ -17,6 +17,8 @@ from settings import *  # pylint:disable=wildcard-import,unused-wildcard-import
 
 log = logging.getLogger()
 
+with open('README.md', 'rb') as fp:
+    README = fp.read().decode()
 
 def exec_cmd(cmdline, *args, **kwargs):
     msg = kwargs.get("msg")
@@ -271,6 +273,8 @@ setup(
     name="st-pyv8",
     version=STPYV8_VERSION,
     description="Python Wrapper for Google V8 Engine",
+    long_description=README,
+    long_description_content_type="text/markdown",
     platforms="x86",
     author="Philip Syme, Angelo Dell'Aera, drunkdream",
     url="https://github.com/drunkdream/stpyv8",
