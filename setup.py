@@ -1,24 +1,21 @@
 #!/usr/bin/env python
 
 import logging
-import os
 import shutil
 import subprocess
-import sys
-import tarfile
-import tempfile
-import urllib.request
 
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
 from setuptools.command.install import install
+from wheel.bdist_wheel import bdist_wheel
 
 from settings import *  # pylint:disable=wildcard-import,unused-wildcard-import
 
 log = logging.getLogger()
 
-with open('README.md', 'rb') as fp:
-    README = fp.read().decode()
+ICU_DATA_PACKAGE_FOLDER = os.path.join(os.pardir, os.pardir, "stpyv8-icu")
+ICU_DATA_V8_FILE_PATH = os.path.join("v8", "out.gn", "x64.release.sample", "icudtl.dat")
+
 
 def exec_cmd(cmdline, *args, **kwargs):
     msg = kwargs.get("msg")
@@ -29,7 +26,7 @@ def exec_cmd(cmdline, *args, **kwargs):
         print(msg)
 
     cmdline = " ".join([cmdline] + list(args))
-    print(cmdline)
+
     proc = subprocess.Popen(
         cmdline,  # pylint:disable=consider-using-with
         shell=kwargs.get("shell", True),
@@ -55,7 +52,7 @@ def exec_cmd(cmdline, *args, **kwargs):
 def install_depot():
     if not os.path.exists(DEPOT_HOME):
         exec_cmd(
-            "git clone",
+            "git clone --depth 1",
             DEPOT_GIT_URL,
             DEPOT_HOME,
             cwd=os.path.dirname(DEPOT_HOME),
@@ -66,7 +63,7 @@ def install_depot():
 
     # depot_tools updates itself automatically when running gclient tool
     if os.path.isfile(os.path.join(DEPOT_HOME, "gclient")):
-        _, stdout, _ = exec_cmd(
+        success, stdout, __ = exec_cmd(
             os.path.join(DEPOT_HOME, "gclient"),  # pylint:disable=unused-variable
             "--version",
             cwd=DEPOT_HOME,
@@ -74,81 +71,52 @@ def install_depot():
             msg="Found depot tools",
         )
 
-
-def build_boost():
-    url = (
-        "https://boostorg.jfrog.io/artifactory/main/release/%s/source/boost_%s.tar.gz"
-        % (BOOST_VERSION, BOOST_VERSION.replace(".", "_"))
-    )
-    if not os.path.isdir(BOOST_HOME):
-        os.makedirs(BOOST_HOME)
-    bootstrap_path = os.path.join(
-        BOOST_HOME, "boost_%s" % BOOST_VERSION.replace(".", "_"), "bootstrap.sh"
-    )
-    if not os.path.isfile(bootstrap_path):
-        print(f"Checkout boost from {url}")
-        save_path = tempfile.mkstemp(".tar.gz")[1]
-        with open(save_path, "wb") as fp:
-            rsp = urllib.request.urlopen(url)
-            fp.write(rsp.read())
-        tar = tarfile.open(save_path, "r:gz")
-        tar.extractall(BOOST_HOME)
-
-    args = ""
-    if sys.platform == "darwin":
-        args += " compiler.balcklist clang --with-toolset=clang"
-    bootstrap = "./bootstrap.sh"
-    build_dir = os.path.dirname(bootstrap_path)
-    if sys.platform == "win32":
-        bootstrap = "bootstrap.bat"
-        build_dir = os.path.join(build_dir, "tools", "build")
-    exec_cmd(bootstrap + args, cwd=build_dir, msg="Run boost bootstrap")
-
-    b2 = "./b2"
-    cxxflags = (
-        f"-fPIC $(python{sys.version_info[0]}.{sys.version_info[1]}-config --includes)"
-    )
-
-    if sys.platform == "darwin":
-        cxxflags += " -stdlib=libc++"
-    elif sys.platform == "win32":
-        b2 = r"tools\build\b2"
-    cmdline = f"{b2} --with-system --with-iostreams --with-thread --with-date_time --with-python threading=multi"
-    if sys.platform != "win32":
-        cmdline += f' cxxflags="{cxxflags}"'
-    else:
-        cmdline += " toolset=msvc link=static runtime-link=static"
-    exec_cmd(
-        cmdline,
-        cwd=os.path.dirname(bootstrap_path),
-        msg="Build boost static libraries",
-    )
+        if not success:
+            exit(1)
 
 
 def checkout_v8():
+    install_depot()
+
     if not os.path.exists(V8_HOME):
-        exec_cmd(
+        success, _, __ = exec_cmd(
             os.path.join(DEPOT_HOME, "fetch"),
+            "--no-history",
             "v8",
             cwd=os.path.dirname(V8_HOME),
             msg="Fetching Google V8 code",
         )
 
-    exec_cmd(
-        "git fetch --tags", cwd=V8_HOME, msg="Fetching the release tag information"
+        if not success:
+            exit(1)
+
+    success, _, __ = exec_cmd(
+        "git fetch --tags --quiet",
+        cwd=V8_HOME,
+        msg="Fetching the release tag information",
     )
 
-    exec_cmd(
+    if not success:
+        exit(1)
+
+    success, _, __ = exec_cmd(
         "git checkout", V8_GIT_TAG, cwd=V8_HOME, msg=f"Checkout Google V8 v{V8_GIT_TAG}"
     )
 
-    exec_cmd(
+    if not success:
+        exit(1)
+
+    success, _, __ = exec_cmd(
         os.path.join(DEPOT_HOME, "gclient"),
         "sync",
         "-D",
+        "-j8",
         cwd=os.path.dirname(V8_HOME),
         msg="Syncing Google V8 code",
     )
+
+    if not success:
+        exit(1)
 
     # On Linux, install additional dependencies, per
     # https://v8.dev/docs/build step 4
@@ -160,27 +128,37 @@ def checkout_v8():
         )
         and v8_deps_linux
     ):
-        exec_cmd(
+        success, _, __ = exec_cmd(
             "./v8/build/install-build-deps.sh",
             cwd=os.path.dirname(V8_HOME),
             msg="Installing additional linux dependencies",
         )
 
+        if not success:
+            exit(1)
+
 
 def build_v8():
-    exec_cmd(
+    args = f"gen {os.path.join('out.gn', 'x64.release.sample')} --args=\"{GN_ARGS}\""
+    success, _, __ = exec_cmd(
         os.path.join(DEPOT_HOME, "gn"),
-        f'gen out.gn/x64.release.sample --args="{GN_ARGS}"',
+        args,
         cwd=V8_HOME,
         msg=f"Generate build scripts for V8 (v{V8_GIT_TAG})",
     )
 
-    exec_cmd(
+    if not success:
+        exit(1)
+
+    success, _, __ = exec_cmd(
         os.path.join(DEPOT_HOME, "ninja"),
-        "-C out.gn/x64.release.sample v8_monolith",
+        f"-C {os.path.join('out.gn', 'x64.release.sample')} v8_monolith",
         cwd=V8_HOME,
         msg="Build V8 with ninja",
     )
+
+    if not success:
+        exit(1)
 
 
 def clean_stpyv8():
@@ -192,49 +170,47 @@ def clean_stpyv8():
 
 def prepare_v8():
     try:
-        install_depot()
         checkout_v8()
         build_v8()
         # clean_stpyv8()
     except Exception as e:  # pylint:disable=broad-except
-        log.exception("Fail to checkout and build v8")
+        log.error("Fail to checkout and build v8, %s", str(e))
 
 
-class stpyv8_build_boost(build_ext):
+class stpyv8_bdist_wheel(bdist_wheel):
+    user_options = bdist_wheel.user_options + [
+        ("skip-build-v8", None, "don't build v8")
+    ]
+
+    def initialize_options(self) -> None:
+        bdist_wheel.initialize_options(self)
+
+        self.skip_build_v8 = None
+
     def run(self):
-        build_boost()
+        if not self.skip_build_v8:
+            prepare_v8()
+
+        bdist_wheel.run(self)
 
 
 class stpyv8_build(build_ext):
     def run(self):
-        V8_GIT_TAG = (
-            V8_GIT_TAG_STABLE  # pylint:disable=redefined-outer-name,unused-variable
-        )
-        build_boost()
-        if sys.platform == "darwin":
-            lib_root = os.path.join(BOOST_ROOT, "stage", "lib")
-            for it in os.listdir(lib_root):
-                if it.endswith(".dylib"):
-                    print(f"Remove file {it}")
-                    os.remove(os.path.join(lib_root, it))
-        prepare_v8()
+        V8_GIT_TAG = V8_GIT_TAG_STABLE  # pylint:disable=redefined-outer-name,unused-variable
+
         build_ext.run(self)
 
 
 class stpyv8_develop(build_ext):
     def run(self):
-        V8_GIT_TAG = (
-            V8_GIT_TAG_MASTER  # pylint:disable=redefined-outer-name,unused-variable
-        )
+        V8_GIT_TAG = V8_GIT_TAG_MASTER  # pylint:disable=redefined-outer-name,unused-variable
         prepare_v8()
         build_ext.run(self)
 
 
 class stpyv8_install_v8(build_ext):
     def run(self):
-        V8_GIT_TAG = (
-            V8_GIT_TAG_MASTER  # pylint:disable=redefined-outer-name,unused-variable
-        )
+        V8_GIT_TAG = V8_GIT_TAG_MASTER  # pylint:disable=redefined-outer-name,unused-variable
         prepare_v8()
 
 
@@ -247,15 +223,12 @@ class stpyv8_build_no_v8(build_ext):
 class stpyv8_install(install):
     def run(self):
         self.skip_build = True  # pylint:disable=attribute-defined-outside-init
-
-        if icu_data_folder:
-            os.makedirs(icu_data_folder, exist_ok=True)
-            shutil.copy(
-                os.path.join(V8_HOME, "out.gn/x64.release.sample/icudtl.dat"),
-                icu_data_folder,
-            )
-
         install.run(self)
+
+
+class stpyv8_checkout_v8(build_ext):
+    def run(self):
+        checkout_v8()
 
 
 stpyv8 = Extension(
@@ -273,16 +246,20 @@ setup(
     name="st-pyv8",
     version=STPYV8_VERSION,
     description="Python Wrapper for Google V8 Engine",
-    long_description=README,
-    long_description_content_type="text/markdown",
-    platforms="x86",
+    long_description=open("README.md").read(),
+    platforms=["Linux", "MacOS", "Windows"],
     author="Philip Syme, Angelo Dell'Aera, drunkdream",
     url="https://github.com/drunkdream/stpyv8",
     license="Apache License 2.0",
     py_modules=["STPyV8"],
     ext_modules=[stpyv8],
+    install_requires=["importlib_resources; python_version < '3.10'"],
+    setup_requires=["wheel"],
+    data_files=[
+        (ICU_DATA_PACKAGE_FOLDER, [ICU_DATA_V8_FILE_PATH]),
+    ],
     classifiers=[
-        "Development Status :: 4 - Beta",
+        "Development Status :: 5 - Production/Stable",
         "Environment :: Plugins",
         "Intended Audience :: Developers",
         "Intended Audience :: System Administrators",
@@ -295,19 +272,23 @@ setup(
         "Topic :: Software Development",
         "Topic :: Software Development :: Libraries :: Python Modules",
         "Topic :: Utilities",
+        "Operating System :: POSIX :: Linux",
+        "Operating System :: MacOS :: MacOS X",
+        "Operating System :: Microsoft :: Windows",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.6",
-        "Programming Language :: Python :: 3.7",
-        "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
     ],
+    long_description_content_type="text/markdown",
     cmdclass=dict(
+        bdist_wheel=stpyv8_bdist_wheel,
         build_ext=stpyv8_build,
         develop=stpyv8_develop,
         v8=stpyv8_install_v8,
         stpyv8=stpyv8_build_no_v8,
         install=stpyv8_install,
-        boost=stpyv8_build_boost,
+        checkout_v8=stpyv8_checkout_v8,
     ),
 )

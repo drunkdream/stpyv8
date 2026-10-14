@@ -5,19 +5,18 @@ import platform
 STPYV8_HOME = os.path.dirname(os.path.realpath(__file__))
 DEPOT_HOME = os.environ.get("DEPOT_HOME", os.path.join(STPYV8_HOME, "depot_tools"))
 V8_HOME = os.environ.get("V8_HOME", os.path.join(STPYV8_HOME, "v8"))
-BOOST_HOME = os.environ.get("BOOST_HOME", os.path.join(STPYV8_HOME, "boost"))
 
 V8_GIT_URL = "https://chromium.googlesource.com/v8/v8.git"
-V8_GIT_TAG_STABLE = "10.5.218.7"
+V8_GIT_TAG_STABLE = "13.1.201.22"
 V8_GIT_TAG_MASTER = "master"
 V8_GIT_TAG = V8_GIT_TAG_STABLE
 DEPOT_GIT_URL = "https://chromium.googlesource.com/chromium/tools/depot_tools.git"
-BOOST_VERSION = "1.76.0"
-BOOST_ROOT = os.path.join(BOOST_HOME, "boost_%s" % BOOST_VERSION.replace(".", "_"))
 
 STPYV8_VERSION = V8_GIT_TAG_STABLE
 
 v8_deps_linux = os.environ.get("V8_DEPS_LINUX", "1") in ("1",)
+
+os.environ["PATH"] = f"{os.environ.get('PATH', '')}:{DEPOT_HOME}"
 
 ICU_DATA_FOLDER_UNIX = "/usr/share/stpyv8"
 ICU_DATA_FOLDER_OSX = "/Library/Application Support/STPyV8/"
@@ -29,10 +28,8 @@ if os.name in ("posix",):
 else:
     icu_data_folder = None
 
-os.environ["PATH"] = f"{os.environ['PATH']}:{DEPOT_HOME}"
-
 gn_args = {
-    "dcheck_always_on": "true" if os.environ.get("STPYV8_DEBUG") else "false",
+    "dcheck_always_on": "false",
     "is_component_build": "false",
     "is_debug": "true" if os.environ.get("STPYV8_DEBUG") else "false",
     "treat_warnings_as_errors": "false",
@@ -46,8 +43,6 @@ gn_args = {
     "v8_monolithic": "true",
     "v8_use_external_startup_data": "false",
 }
-
-GN_ARGS = " ".join(f"{key}={value}" for key, value in gn_args.items())
 
 source_files = [
     "Exception.cpp",
@@ -63,23 +58,17 @@ source_files = [
 
 
 macros = [("BOOST_PYTHON_STATIC_LIB", None)]
-include_dirs = [BOOST_ROOT]
-library_dirs = [os.path.join(BOOST_ROOT, "stage", "lib")]
+include_dirs = set()
+library_dirs = set()
 libraries = []
 extra_compile_args = []
 extra_link_args = []
-if sys.platform == "linux":
-    extra_link_args += [
-        "-L/usr/lib/x86_64-linux-gnu",
-        "-l:libstdc++.a",
-        "-l:libboost_system.a",
-        "-l:libboost_iostreams.a",
-        f"-l:libboost_python{sys.version_info[0]}{sys.version_info[1]}.a",
-        "-l:libv8_monolith.a",
-    ]
 
-include_dirs.append(os.path.join(V8_HOME, "include"))
-library_dirs.append(os.path.join(V8_HOME, "out.gn/x64.release.sample/obj/"))
+include_dirs.add(os.path.join(V8_HOME, "include"))
+library_dirs.add(
+    os.path.join(V8_HOME, os.path.join("out.gn", "x64.release.sample", "obj"))
+)
+
 
 BOOST_PYTHON_LIB_SHORT = f"boost_python{sys.version_info.major}"
 BOOST_PYTHON_LIB_LONG = f"boost_python{sys.version_info.major}{sys.version_info.minor}"
@@ -127,18 +116,54 @@ STPYV8_BOOST_PYTHON = os.getenv(
 )
 
 if os.name in ("nt",):
-    os.environ["DEPOT_TOOLS_WIN_TOOLCHAIN"] = "0"
-    if os.environ.get("INCLUDE"):
-        include_dirs += os.environ["INCLUDE"].split(";")
-    if os.environ.get("LIB"):
-        library_dirs += os.environ["LIB"].split(";")
-    libraries += ["winmm", "ws2_32", "advapi32", "dbghelp", "v8_monolith"]
-    extra_compile_args += ["/O2", "/GL", "/MT", "/EHsc", "/Gy", "/Zi", "/std:c++17"]
+    include_dirs.add(os.path.join(V8_HOME, "include"))
+    library_dirs.add(os.path.join(V8_HOME, "out.gn", "x64.release.sample", "obj"))
+
+    if "BOOST_ROOT" in os.environ:
+        include_dirs.add(os.environ.get("BOOST_ROOT"))
+        library_dirs.add(os.path.join(os.environ["BOOST_ROOT"], "stage", "lib"))
+
+    if "Python_ROOT_DIR" in os.environ:
+        include_dirs.add(os.path.join(os.environ["Python_ROOT_DIR"], "include"))
+        library_dirs.add(os.path.join(os.environ["Python_ROOT_DIR"], "libs"))
+
+    if "INCLUDE" in os.environ:
+        for p in os.environ["INCLUDE"].split(";"):
+            include_dirs.add(p)
+    if "LIB" in os.environ:
+        for p in os.environ["LIB"].split(";"):
+            library_dirs.add(p)
+
+    libraries += ["winmm", "ws2_32", "Advapi32", "dbghelp", "v8_monolith"]
+    extra_compile_args += ["/O2", "/GL", "/MT", "/EHsc", "/Gy", "/Zi", "/std:c++20", "/Zc:__cplusplus"]
     extra_link_args += ["/DLL", "/OPT:REF", "/OPT:ICF", "/MACHINE:X64"]
+    macros += [
+        ("HAVE_SNPRINTF", None),
+    ]
+
+    os.environ["DEPOT_TOOLS_WIN_TOOLCHAIN"] = "0"
+
 elif os.name in ("posix",):
-    if sys.platform == "darwin":
-        libraries = ["boost_system", "boost_iostreams", "v8_monolith", STPYV8_BOOST_PYTHON]
-    extra_compile_args.append("-std=c++17")
+    libraries = [
+        "boost_system",
+        "boost_iostreams",
+        "boost_filesystem",
+        "v8_monolith",
+        STPYV8_BOOST_PYTHON.replace(".", ""),
+    ]
+
+    extra_compile_args.append("-Wno-strict-aliasing")
+    extra_compile_args.append("-Wno-array-bounds")
 
     if platform.system() in ("Linux",):
         libraries.append("rt")
+        extra_compile_args.append("-std=c++2a")
+    else:
+        extra_compile_args.append("-std=c++20")
+        extra_link_args.append("-headerpad_max_install_names")
+
+
+GN_ARGS = " ".join(f"{key}={value}" for key, value in gn_args.items())
+
+include_dirs = list(include_dirs)
+library_dirs = list(library_dirs)

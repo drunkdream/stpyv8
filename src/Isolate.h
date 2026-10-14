@@ -1,6 +1,7 @@
 #pragma once
 
-#include <v8.h>
+#include <v8.h> 
+
 #include "Exception.h"
 
 class CIsolate
@@ -31,9 +32,11 @@ public:
     void Enter(void) {
         m_isolate->Enter();
     }
+
     void Leave(void) {
         m_isolate->Exit();
     }
+
     void Dispose(void) {
         m_isolate->Dispose();
     }
