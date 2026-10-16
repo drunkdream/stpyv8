@@ -81,24 +81,44 @@ void CContext::Expose(void)
     py::objects::pointer_holder<std::shared_ptr<CContext>,CContext> > >();
 }
 
-CContext::CContext(v8::Handle<v8::Context> context)
+CContext::CContext(v8::Isolate* isolate, v8::Handle<v8::Context> context)
+    : m_isolate(isolate)
 {
-    v8::HandleScope handle_scope(v8::Isolate::GetCurrent());
+    v8::HandleScope handle_scope(isolate);
 
-    m_context.Reset(context->GetIsolate(), context);
+    m_context.Reset(isolate, context);
 }
 
 CContext::CContext(const CContext& context)
+    : m_global(context.m_global), m_isolate(v8::Isolate::GetCurrent())
 {
-    v8::HandleScope handle_scope(v8::Isolate::GetCurrent());
+    v8::Isolate* isolate = m_isolate;
+    v8::HandleScope handle_scope(isolate);
 
-    m_context.Reset(context.Handle()->GetIsolate(), context.Handle());
+    // "Create a new context based on an existing context": build a fresh
+    // context in the *current* isolate, reusing the same global object.
+    // The previous implementation only created another Persistent onto the very
+    // same v8::Context, which is invalid as soon as the current isolate is not
+    // the one owning it (e.g. `JSContext(g)` inside a `JSIsolate()` block on
+    // another thread) and corrupts V8 state for later isolates.
+    v8::Handle<v8::Context> new_context = v8::Context::New(isolate);
+
+    m_context.Reset(isolate, new_context);
+
+    v8::Context::Scope context_scope(Handle());
+
+    if (!m_global.is_none())
+    {
+        Handle()->Global()->Set(new_context,
+                                v8::String::NewFromUtf8(isolate, "__proto__").ToLocalChecked(),
+                                CPythonObject::Wrap(m_global));
+    }
 }
 
 CContext::CContext(py::object global)
-    : m_global(global)
+    : m_global(global), m_isolate(v8::Isolate::GetCurrent())
 {
-    v8::Isolate* isolate = v8::Isolate::GetCurrent();
+    v8::Isolate* isolate = m_isolate;
     v8::HandleScope handle_scope(isolate);
 
     v8::Handle<v8::Context> context = v8::Context::New(isolate);
@@ -170,7 +190,7 @@ py::object CContext::GetEntered(void)
     v8::Handle<v8::Context> entered = isolate->GetEnteredOrMicrotaskContext();
 
     return (entered.IsEmpty()) ? py::object() :
-           py::object(py::handle<>(boost::python::converter::shared_ptr_to_python<CContext>(CContextPtr(new CContext(entered)))));
+           py::object(py::handle<>(boost::python::converter::shared_ptr_to_python<CContext>(CContextPtr(new CContext(isolate, entered)))));
 }
 
 py::object CContext::GetCurrent(void)
@@ -184,7 +204,7 @@ py::object CContext::GetCurrent(void)
     v8::Handle<v8::Context> current = isolate->GetCurrentContext();
 
     return (current.IsEmpty()) ? py::object() :
-           py::object(py::handle<>(boost::python::converter::shared_ptr_to_python<CContext>(CContextPtr(new CContext(current)))));
+           py::object(py::handle<>(boost::python::converter::shared_ptr_to_python<CContext>(CContextPtr(new CContext(isolate, current)))));
 }
 
 py::object CContext::GetCalling(void)
@@ -199,7 +219,7 @@ py::object CContext::GetCalling(void)
     v8::Handle<v8::Context> calling = isolate->GetCurrentContext();
 
     return (calling.IsEmpty()) ? py::object() :
-           py::object(py::handle<>(boost::python::converter::shared_ptr_to_python<CContext>(CContextPtr(new CContext(calling)))));
+           py::object(py::handle<>(boost::python::converter::shared_ptr_to_python<CContext>(CContextPtr(new CContext(isolate, calling)))));
 }
 
 py::object CContext::Evaluate(const std::string& src,

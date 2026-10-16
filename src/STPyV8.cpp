@@ -4,10 +4,13 @@
 #include "Context.h"
 #include "Engine.h"
 #include "Locker.h"
+#include "CrashHandler.h"
 
 
 BOOST_PYTHON_MODULE(_STPyV8)
 {
+    InstallCrashHandler();
+
     CJavascriptException::Expose();
     CWrapper::Expose();
     CContext::Expose();

@@ -113,6 +113,15 @@ class TestEngine(unittest.TestCase):
             self.assertEqual(Global.version, float(ctxt.eval("this.valueOf()").version))
             self.assertTrue(bool(ctxt.eval('this.hasOwnProperty("version")')))
             self.assertFalse(ctxt.eval('this.hasOwnProperty("nonexistent")'))
+            # No-argument call must not throw and must return false, matching the
+            # standard Object.prototype.hasOwnProperty (the missing key is treated
+            # as undefined). aria.js and similar SDKs call it with no args.
+            self.assertFalse(bool(ctxt.eval('this.hasOwnProperty()')))
+            self.assertFalse(bool(ctxt.eval('this.hasOwnProperty(undefined)')))
+            # isPrototypeOf must not throw (it used to raise NotImplementedError)
+            # and returns a boolean for any argument.
+            self.assertFalse(bool(ctxt.eval('this.isPrototypeOf()')))
+            self.assertFalse(bool(ctxt.eval('this.isPrototypeOf(undefined)')))
 
     def testPythonWrapper(self):
         class Global(STPyV8.JSClass):

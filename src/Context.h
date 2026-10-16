@@ -19,9 +19,14 @@ typedef std::shared_ptr<CIsolate> CIsolatePtr;
 class CContext
 {
     py::object m_global;
+    // The isolate owning m_context. V8 removed v8::Context::GetIsolate(), and
+    // Isolate::GetCurrent() is wrong whenever a context is touched from a thread
+    // whose current isolate is not the owning one (e.g. a CContext copied into a
+    // worker thread), so the owner is tracked explicitly.
+    v8::Isolate* m_isolate;
     v8::Persistent<v8::Context> m_context;
 public:
-    CContext(v8::Handle<v8::Context> context);
+    CContext(v8::Isolate* isolate, v8::Handle<v8::Context> context);
     CContext(const CContext& context);
     CContext(py::object global);
 
@@ -31,7 +36,7 @@ public:
     }
 
     v8::Handle<v8::Context> Handle(void) const {
-        return v8::Local<v8::Context>::New(v8::Isolate::GetCurrent(), m_context);
+        return v8::Local<v8::Context>::New(m_isolate, m_context);
     }
 
     py::object GetGlobal(void);
@@ -43,11 +48,11 @@ public:
         return !m_context.IsEmpty();
     }
     void Enter(void) {
-        v8::HandleScope handle_scope(v8::Isolate::GetCurrent());
+        v8::HandleScope handle_scope(m_isolate);
         Handle()->Enter();
     }
     void Leave(void) {
-        v8::HandleScope handle_scope(v8::Isolate::GetCurrent());
+        v8::HandleScope handle_scope(m_isolate);
         Handle()->Exit();
     }
 

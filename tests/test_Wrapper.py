@@ -22,6 +22,50 @@ def convert(obj):
     return obj
 
 
+def _make_dom():
+    """Build a small DOM-like JSClass hierarchy (fresh classes per call).
+
+    Mirrors the real-world case where a Python class hierarchy
+    (JSElement -> JSHTMLElement -> ... -> JSNode) must map onto the JS
+    prototype chain so that ``instanceof``, ``.constructor`` and ``__proto__``
+    behave as expected.
+    """
+    class JSNode(STPyV8.JSClass):
+        nodeKind = "node"
+        # class / static attributes -- must be exposed on the constructor.
+        UNSENT = 0
+        OPENED = 1
+
+        @classmethod
+        def make(cls):
+            return cls()
+
+        def describe(self):
+            return "node:" + self.nodeKind
+
+    class JSElement(JSNode):
+        pass
+
+    class JSHTMLElement(JSElement):
+        def describe(self):  # override the base implementation
+            return "html:" + self.nodeKind
+
+    class Element(JSHTMLElement):
+        def __init__(self):
+            self.tagName = "BODY"
+
+    class Para(JSHTMLElement):
+        pass
+
+    return {
+        "JSNode": JSNode,
+        "JSElement": JSElement,
+        "JSHTMLElement": JSHTMLElement,
+        "Element": Element,
+        "Para": Para,
+    }
+
+
 class TestWrapper(unittest.TestCase):
     def testObject(self):
         with STPyV8.JSContext() as ctxt:
@@ -126,9 +170,11 @@ class TestWrapper(unittest.TestCase):
             self.assertEqual("MyString", typename("var_mystr"))
             self.assertEqual("MyDateTime", typename("var_mytime"))
 
-            self.assertEqual("function", typeof("var_myint"))
-            self.assertEqual("function", typeof("var_mystr"))
-            self.assertEqual("function", typeof("var_mytime"))
+            # A JSClass instance that is not callable reports typeof "object"
+            # (only classes defining __call__ are callable => typeof "function").
+            self.assertEqual("object", typeof("var_myint"))
+            self.assertEqual("object", typeof("var_mystr"))
+            self.assertEqual("object", typeof("var_mytime"))
 
     def testJavascriptWrapper(self):
         with STPyV8.JSContext() as ctxt:
@@ -1100,3 +1146,189 @@ class TestWrapper(unittest.TestCase):
             self.assertTrue(ctxt.eval("null == returnNull()"))
             self.assertTrue(ctxt.eval("undefined == returnUndefined()"))
             self.assertTrue(ctxt.eval("null == returnNone()"))
+
+    def testClassHierarchy(self):
+        # Python inheritance must be mirrored into the JS prototype chain so
+        # that `instanceof` works against every ancestor and `constructor` is
+        # the real (shared) class constructor -- not a fabricated, per-access
+        # object whose prototype is Function.prototype.
+        dom = _make_dom()
+
+        class Global(STPyV8.JSClass):
+            def __init__(self):
+                self.body = dom["Element"]()
+                self.p = dom["Para"]()
+                self.Element = dom["Element"]
+                self.JSHTMLElement = dom["JSHTMLElement"]
+                self.JSElement = dom["JSElement"]
+                self.JSNode = dom["JSNode"]
+
+        with STPyV8.JSContext(Global()) as ctxt:
+            self.assertTrue(ctxt.eval("body instanceof Element"))
+            self.assertTrue(ctxt.eval("body instanceof JSHTMLElement"))
+            self.assertTrue(ctxt.eval("body instanceof JSElement"))
+            self.assertTrue(ctxt.eval("body instanceof JSNode"))
+            self.assertTrue(ctxt.eval("body instanceof Object"))
+
+            self.assertTrue(ctxt.eval("body.constructor === Element"))
+            self.assertEqual("Element", ctxt.eval("body.constructor.name"))
+            self.assertEqual("Para", ctxt.eval("p.constructor.name"))
+
+            # A sibling class must not be an instance of the other.
+            self.assertFalse(ctxt.eval("p instanceof Element"))
+
+            self.assertTrue(
+                ctxt.eval("Object.getPrototypeOf(body) === Element.prototype")
+            )
+            self.assertEqual(
+                "Element,JSHTMLElement,JSElement,JSNode,JSClass,Object",
+                ctxt.eval(
+                    "(function(){var out=[],p=Object.getPrototypeOf(body),n=0;"
+                    "while(p&&n<10){out.push((p.constructor&&p.constructor.name)||'?');"
+                    "p=Object.getPrototypeOf(p);n++;}return out.join(',');})()"
+                ),
+            )
+
+    def testClassHierarchyPrototypeIdentity(self):
+        dom = _make_dom()
+
+        class Global(STPyV8.JSClass):
+            def __init__(self):
+                self.a = dom["Element"]()
+                self.b = dom["Element"]()
+                self.other = dom["Para"]()
+                self.Element = dom["Element"]
+
+        with STPyV8.JSContext(Global()) as ctxt:
+            # Same class -> the exact same prototype object.
+            self.assertTrue(
+                ctxt.eval("Object.getPrototypeOf(a) === Object.getPrototypeOf(b)")
+            )
+            # Different classes -> different prototypes.
+            self.assertFalse(
+                ctxt.eval(
+                    "Object.getPrototypeOf(a) === Object.getPrototypeOf(other)"
+                )
+            )
+            # The prototype's constructor is the (stable) exposed class.
+            self.assertTrue(ctxt.eval("Element.prototype.constructor === Element"))
+            # constructor / class identity is stable across accesses (not a
+            # fresh fabricated object every time).
+            self.assertTrue(ctxt.eval("a.constructor === a.constructor"))
+            self.assertTrue(ctxt.eval("a.constructor === Element"))
+            self.assertTrue(ctxt.eval("Element === Element"))
+
+    def testClassHierarchyInheritedMembers(self):
+        dom = _make_dom()
+
+        class Global(STPyV8.JSClass):
+            def __init__(self):
+                self.body = dom["Element"]()
+
+        with STPyV8.JSContext(Global()) as ctxt:
+            # Own instance attribute.
+            self.assertEqual("BODY", ctxt.eval("body.tagName"))
+            # Class attribute inherited from the base class.
+            self.assertEqual("node", ctxt.eval("body.nodeKind"))
+            # Method override resolved through the Python MRO.
+            self.assertEqual("html:node", ctxt.eval("body.describe()"))
+
+    def testClassHierarchyNewInstance(self):
+        dom = _make_dom()
+
+        class Global(STPyV8.JSClass):
+            def __init__(self):
+                self.Element = dom["Element"]
+                self.JSHTMLElement = dom["JSHTMLElement"]
+
+        with STPyV8.JSContext(Global()) as ctxt:
+            self.assertEqual("function", ctxt.eval("typeof Element"))
+            # `new Element()` instantiates the Python class (its __init__ runs)
+            # and yields a proper instance of the hierarchy.
+            self.assertTrue(ctxt.eval("(new Element()) instanceof Element"))
+            self.assertTrue(ctxt.eval("(new Element()) instanceof JSHTMLElement"))
+            self.assertEqual("BODY", ctxt.eval("(new Element()).tagName"))
+            self.assertEqual("html:node", ctxt.eval("(new Element()).describe()"))
+
+    def testClassHierarchyCallable(self):
+        # `typeof` is "function" only for classes that define __call__; a plain
+        # object reports "object" and is not callable in JS (standard semantics).
+        class Callable_(STPyV8.JSClass):
+            def __call__(self, name):  # pylint:disable=no-self-use
+                return "hi " + name
+
+        class Plain(STPyV8.JSClass):
+            pass
+
+        class Global(STPyV8.JSClass):
+            def __init__(self):
+                self.c = Callable_()
+                self.o = Plain()
+
+        with STPyV8.JSContext(Global()) as ctxt:
+            self.assertEqual("function", ctxt.eval("typeof c"))
+            self.assertEqual("object", ctxt.eval("typeof o"))
+            self.assertEqual("hi world", ctxt.eval("c('world')"))
+            self.assertTrue(
+                ctxt.eval(
+                    "(function(){try{o();return false}"
+                    "catch(e){return e instanceof TypeError}})()"
+                )
+            )
+
+    def testClassStaticProperties(self):
+        # Python class / static attributes must be visible as own properties on
+        # the exposed constructor function, so `XMLHttpRequest.UNSENT` style
+        # access works without manually mounting them in JS.
+        dom = _make_dom()
+
+        class Global(STPyV8.JSClass):
+            def __init__(self):
+                self.Element = dom["Element"]
+                self.JSNode = dom["JSNode"]
+
+        with STPyV8.JSContext(Global()) as ctxt:
+            # Class attributes exposed as static properties.
+            self.assertEqual(0, ctxt.eval("Element.UNSENT"))
+            self.assertEqual(1, ctxt.eval("Element.OPENED"))
+            self.assertEqual("node", ctxt.eval("Element.nodeKind"))
+            # Inherited from the base class through the Python MRO.
+            self.assertEqual(0, ctxt.eval("JSNode.UNSENT"))
+            # A classmethod is exposed as a static callable.
+            self.assertEqual("function", ctxt.eval("typeof Element.make"))
+            # Native function properties are not clobbered.
+            self.assertEqual("Element", ctxt.eval("Element.name"))
+            self.assertEqual("function", ctxt.eval("typeof Element"))
+            # It is a genuine own property of the constructor.
+            self.assertTrue(ctxt.eval("Object.getOwnPropertyNames(Element).indexOf('UNSENT') >= 0"))
+
+    def testDeleteWithNonStringKey(self):
+        # CPythonObject::NamedDeleter used to forward a nullptr name to
+        # PyObject_HasAttrString whenever the key could not be converted to a
+        # UTF-8 string, which crashed with an access violation reading 0x0
+        # inside python312.dll (it was the only interceptor missing the guard
+        # that NamedGetter/NamedSetter/NamedQuery all have).
+        class Obj(STPyV8.JSClass):
+            def __init__(self):
+                self.x = 1
+
+        class Global(STPyV8.JSClass):
+            def __init__(self):
+                self.o = Obj()
+
+        with STPyV8.JSContext(Global()) as ctxt:
+            # A normal string key still deletes the Python attribute.
+            self.assertEqual(1, ctxt.eval("o.x"))
+            ctxt.eval("delete o.x")
+            self.assertTrue(ctxt.eval("o.x") is None)
+
+            # Symbol keys cannot be forwarded to Python by name: must be a
+            # no-op, not a crash.
+            self.assertTrue(ctxt.eval("delete o[Symbol('nope')]"))
+
+            # A key V8 cannot encode as UTF-8 must not crash either; it may
+            # surface as a JS ReferenceError, but never a native crash.
+            try:
+                ctxt.eval("delete o['\\uD800']")
+            except ReferenceError:
+                pass

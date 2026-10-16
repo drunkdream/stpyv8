@@ -237,19 +237,37 @@ class JSClass:
         """
         return self
 
-    def hasOwnProperty(self, name):
+    def hasOwnProperty(self, name=None):
         """
         Return a boolean value indicating whether the object has a property
-        with the specified name
+        with the specified name.
+
+        Called with no argument (or ``undefined``) the standard behaviour is to
+        return ``False`` -- the missing key is treated as ``undefined``, which is
+        never an own property -- rather than throwing a TypeError, matching the
+        real ``Object.prototype.hasOwnProperty``.
         """
+        if name is None:
+            return False
         return hasattr(self, name)
 
-    def isPrototypeOf(self, obj):
+    def isPrototypeOf(self, obj=None):
         """
         Return a boolean value indicating whether the object exists in the
-        prototype chain of another object
+        prototype chain of another object.
+
+        The standard ``Object.prototype.isPrototypeOf`` never throws -- it
+        returns ``false`` for any non-object argument (including ``undefined`` /
+        ``null``, which st-pyv8 maps to ``None``). In the JSClass model an
+        instance's prototype chain mirrors its Python class MRO, so when both
+        sides are JSClass instances we check whether *this* instance's class
+        appears in the other instance's class MRO.
         """
-        raise NotImplementedError()
+        if obj is None or not isinstance(obj, JSClass):
+            return False
+        if self is obj:
+            return False
+        return self.__class__ in obj.__class__.__mro__
 
     def __defineGetter__(self, name, getter):
         """

@@ -14,7 +14,9 @@ from settings import *  # pylint:disable=wildcard-import,unused-wildcard-import
 log = logging.getLogger()
 
 ICU_DATA_PACKAGE_FOLDER = os.path.join(os.pardir, os.pardir, "stpyv8-icu")
-ICU_DATA_V8_FILE_PATH = os.path.join("v8", "out.gn", "x64.release.sample", "icudtl.dat")
+# icudtl.dat lives inside the V8 checkout; follow V8_HOME so an external
+# checkout (V8 built outside the stpyv8 repo) still packages correctly.
+ICU_DATA_V8_FILE_PATH = os.path.join(V8_HOME, "out.gn", "x64.release.sample", "icudtl.dat")
 
 
 def exec_cmd(cmdline, *args, **kwargs):

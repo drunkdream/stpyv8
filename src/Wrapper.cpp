@@ -58,7 +58,7 @@ void CWrapper::Expose(void)
 
     .def(int_(py::self))
     .def(float_(py::self))
-    .def(str(py::self))
+    .def("__str__", &CJavascriptObject::str)
 
     .def("__bool__", &CJavascriptObject::operator bool)
     .def("__eq__", &CJavascriptObject::Equals)
@@ -296,6 +296,15 @@ v8::Intercepted CPythonObject::NamedGetter(v8::Local<v8::Name> prop, const v8::P
     if (*name == nullptr)
         CALLBACK_RETURN_HANDLED(v8::Undefined(info.GetIsolate()));
 
+    // Let V8 resolve these through the real prototype chain (each wrapped class
+    // now has a genuine FunctionTemplate whose .prototype carries `constructor`)
+    // instead of the fabricated values returned by JSClass.__getattr__.
+    {
+        std::string prop_name(*name);
+        if (prop_name == "constructor" || prop_name == "prototype")
+            CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Value>());
+    }
+
     PyObject *value = ::PyObject_GetAttrString(obj.ptr(), *name);
 
     if (!value)
@@ -475,7 +484,16 @@ v8::Intercepted CPythonObject::NamedDeleter(v8::Local<v8::Name> prop, const v8::
 
     py::object obj = CJavascriptObject::Wrap(info.Holder());
 
-    v8::String::Utf8Value name(info.GetIsolate(), prop);
+    // Non-string keys (Symbols, ...) cannot be forwarded to Python by name, and
+    // a failed Utf8Value conversion yields nullptr, which CPython would
+    // dereference -- that used to crash with an access violation reading 0x0
+    // inside python312.dll (see the NamedGetter/Setter/Query guards above).
+    if (!prop->IsString())
+        CALLBACK_RETURN_NOT_HANDLED(v8::False(info.GetIsolate()));
+
+    v8::String::Utf8Value name(info.GetIsolate(), v8::Local<v8::String>::Cast(prop));
+    if (*name == nullptr)
+        CALLBACK_RETURN_NOT_HANDLED(v8::False(info.GetIsolate()));
 
     if (!::PyObject_HasAttrString(obj.ptr(), *name) &&
             ::PyMapping_Check(obj.ptr()))
@@ -861,6 +879,186 @@ v8::Handle<v8::ObjectTemplate> CPythonObject::CreateObjectTemplate(v8::Isolate *
     return handle_scope.Escape(clazz);
 }
 
+v8::Local<v8::ObjectTemplate> CPythonObject::GetObjectTemplate(v8::Isolate *isolate)
+{
+    // One template per isolate: a v8::ObjectTemplate is bound to the isolate
+    // that created it, so sharing a single (function-local static) template
+    // across isolates makes V8 clone a cached instantiation whose map belongs to
+    // a foreign isolate (tripping `is_clonable_js_type`).
+    static std::mutex s_mutex;
+    // v8::Persistent is non-copyable (and non-movable) in this V8, so it cannot
+    // be moved into a map element; hold it behind a unique_ptr instead.
+    static std::unordered_map<v8::Isolate *, std::unique_ptr<v8::Persistent<v8::ObjectTemplate>>> s_cache;
+
+    std::lock_guard<std::mutex> lock(s_mutex);
+
+    auto it = s_cache.find(isolate);
+
+    if (it == s_cache.end())
+    {
+        it = s_cache.emplace(
+            isolate,
+            std::make_unique<v8::Persistent<v8::ObjectTemplate>>(
+                isolate, CreateObjectTemplate(isolate))
+        ).first;
+    }
+
+    return v8::Local<v8::ObjectTemplate>::New(isolate, *it->second);
+}
+
+namespace
+{
+struct ClassTemplateEntry
+{
+    // Keeps the class alive so its address stays a stable cache key.
+    py::object cls;
+    std::unique_ptr<v8::Persistent<v8::FunctionTemplate>> tmpl;
+};
+}  // namespace
+
+v8::Local<v8::FunctionTemplate> CPythonObject::GetClassTemplate(v8::Isolate *isolate, py::object cls)
+{
+    // A v8::FunctionTemplate is bound to the isolate that created it, so cache
+    // one per (isolate, class). recursive_mutex because building a template
+    // recurses into the templates of its base classes.
+    static std::recursive_mutex s_mutex;
+    static std::unordered_map<
+        v8::Isolate *,
+        std::unordered_map<PyObject *, ClassTemplateEntry>> s_cache;
+
+    std::lock_guard<std::recursive_mutex> lock(s_mutex);
+
+    v8::EscapableHandleScope handle_scope(isolate);
+
+    auto &per_isolate = s_cache[isolate];
+    auto it = per_isolate.find(cls.ptr());
+    if (it != per_isolate.end())
+    {
+        return handle_scope.Escape(
+            v8::Local<v8::FunctionTemplate>::New(isolate, *it->second.tmpl));
+    }
+
+    v8::Local<v8::FunctionTemplate> tmpl = v8::FunctionTemplate::New(isolate);
+
+    std::string cls_name = py::extract<std::string>(cls.attr("__name__"));
+    tmpl->SetClassName(
+        v8::String::NewFromUtf8(isolate, cls_name.c_str()).ToLocalChecked());
+
+    // Mirror the Python MRO into the JS prototype chain. V8 templates support
+    // single inheritance, so inherit from the nearest ancestor that is a user
+    // class (skip builtins such as int/str/object).
+    PyObject *mro = ::PyObject_GetAttrString(cls.ptr(), "__mro__");
+    if (mro && PyTuple_Check(mro))
+    {
+        Py_ssize_t count = PyTuple_GET_SIZE(mro);
+        for (Py_ssize_t i = 1; i < count; ++i)
+        {
+            py::object base(py::borrowed<>(PyTuple_GET_ITEM(mro, i)));
+            std::string module = py::extract<std::string>(base.attr("__module__"));
+
+            if (module == "builtins")
+                continue;
+
+            tmpl->Inherit(GetClassTemplate(isolate, base));
+            break;
+        }
+    }
+    Py_XDECREF(mro);
+
+    // Calling the exposed class instantiates the Python class (as before). The
+    // class *function* stays callable regardless of whether its instances are.
+    tmpl->SetCallHandler(Caller, v8::External::New(isolate, new py::object(cls)));
+
+    // `typeof` is "function" only for genuinely callable objects. Make the
+    // instances callable only when the Python class defines __call__ (tp_call
+    // is set); a plain JSClass instance then reports typeof "object", matching
+    // standard JS semantics. Previously every wrapped object was callable, so
+    // `typeof` was always "function".
+    bool instances_callable =
+        PyType_Check(cls.ptr()) &&
+        reinterpret_cast<PyTypeObject *>(cls.ptr())->tp_call != nullptr;
+
+    v8::Local<v8::ObjectTemplate> inst = tmpl->InstanceTemplate();
+    inst->SetInternalFieldCount(1);
+    inst->SetHandler(v8::NamedPropertyHandlerConfiguration(
+        NamedGetter, NamedSetter, NamedQuery, NamedDeleter, NamedEnumerator));
+    inst->SetHandler(v8::IndexedPropertyHandlerConfiguration(
+        IndexedGetter, IndexedSetter, IndexedQuery, IndexedDeleter, IndexedEnumerator));
+    if (instances_callable)
+        inst->SetCallAsFunctionHandler(Caller);
+
+    per_isolate.emplace(
+        cls.ptr(),
+        ClassTemplateEntry{
+            cls, std::make_unique<v8::Persistent<v8::FunctionTemplate>>(isolate, tmpl)});
+
+    return handle_scope.Escape(tmpl);
+}
+
+void CPythonObject::PopulateStaticProperties(v8::Isolate *isolate, py::object cls, v8::Local<v8::Object> func)
+{
+    // Expose the Python class's own attributes (class/static attributes,
+    // classmethods, staticmethods, nested classes, ...) as own properties on the
+    // constructor function. V8 creates one function object per context, so a
+    // fresh function in a new context lacks the marker below and gets populated
+    // again; within a context we populate only once.
+    v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
+
+    v8::Local<v8::Private> marker =
+        v8::Private::ForApi(isolate,
+            v8::String::NewFromUtf8(isolate, "stpyv8_statics_initialized").ToLocalChecked());
+
+    v8::MaybeLocal<v8::Value> existing = func->GetPrivate(ctx, marker);
+    if (!existing.IsEmpty() && existing.ToLocalChecked()->IsTrue())
+        return;
+
+    // Names that must stay native on the function object.
+    static const char *kReserved[] = {
+        "prototype", "constructor", "name", "length", "arguments", "caller", nullptr
+    };
+
+    CPythonGIL python_gil;
+
+    py::list names(py::handle<>(::PyObject_Dir(cls.ptr())));
+    Py_ssize_t n = PyList_GET_SIZE(names.ptr());
+
+    for (Py_ssize_t i = 0; i < n; ++i)
+    {
+        PyObject *nameobj = PyList_GET_ITEM(names.ptr(), i);
+        if (!PyUnicode_Check(nameobj))
+            continue;
+
+        const char *cname = ::PyUnicode_AsUTF8(nameobj);
+        if (!cname)
+            continue;
+
+        std::string name_str(cname);
+
+        // Skip dunder names so we don't surface Python internals as statics.
+        if (name_str.size() >= 4 &&
+                name_str.compare(0, 2, "__") == 0 &&
+                name_str.compare(name_str.size() - 2, 2, "__") == 0)
+            continue;
+
+        bool reserved = false;
+        for (const char **r = kReserved; *r; ++r)
+        {
+            if (name_str == *r) { reserved = true; break; }
+        }
+        if (reserved)
+            continue;
+
+        if (!::PyObject_HasAttrString(cls.ptr(), cname))
+            continue;
+
+        v8::Local<v8::Value> wrapped = Wrap(cls.attr(cname));
+        if (!wrapped.IsEmpty())
+            func->Set(ctx, v8::String::NewFromUtf8(isolate, cname).ToLocalChecked(), wrapped);
+    }
+
+    func->SetPrivate(ctx, marker, v8::True(isolate));
+}
+
 bool CPythonObject::IsWrapped(v8::Handle<v8::Object> obj)
 {
     return obj->InternalFieldCount() == 1;
@@ -954,10 +1152,7 @@ v8::Handle<v8::Value> CPythonObject::WrapInternal(py::object obj)
         }
 
 #ifdef SUPPORT_TRACE_LIFECYCLE
-        static v8::Persistent<v8::ObjectTemplate> s_template(isolate, CreateObjectTemplate(isolate));
-
-        v8::MaybeLocal<v8::Object> instance = v8::Local<v8::ObjectTemplate>::New(
-                isolate, s_template)->NewInstance(
+        v8::MaybeLocal<v8::Object> instance = GetObjectTemplate(isolate)->NewInstance(
                         isolate->GetCurrentContext());
 
         if (!instance.IsEmpty())
@@ -1020,19 +1215,32 @@ v8::Handle<v8::Value> CPythonObject::WrapInternal(py::object obj)
 
         result = v8::Date::New(isolate->GetCurrentContext(), ((double) mktime(&ts)) * 1000 + ms / 1000).ToLocalChecked();
     }
-    else if (PyCFunction_Check(obj.ptr()) || PyFunction_Check(obj.ptr()) || PyMethod_Check(obj.ptr()) || PyType_Check(obj.ptr()))
+    else if (PyType_Check(obj.ptr()))
+    {
+        // A Python class: expose it as its (cached) constructor function -- the
+        // very template used to instantiate its objects -- so that `instanceof`
+        // and `x.constructor === C` stay consistent.
+        v8::Local<v8::FunctionTemplate> tmpl = GetClassTemplate(isolate, obj);
+
+        v8::Local<v8::Function> func =
+            tmpl->GetFunction(isolate->GetCurrentContext()).ToLocalChecked();
+
+        // Expose the class's own attributes as static properties on the
+        // constructor (e.g. `XMLHttpRequest.UNSENT`).
+        PopulateStaticProperties(isolate, obj, func);
+
+        result = func;
+
+#ifdef SUPPORT_TRACE_LIFECYCLE
+        if (!result.IsEmpty()) ObjectTracer::Trace(result, new py::object(obj));
+#endif
+    }
+    else if (PyCFunction_Check(obj.ptr()) || PyFunction_Check(obj.ptr()) || PyMethod_Check(obj.ptr()))
     {
         v8::Handle<v8::FunctionTemplate> func_tmpl = v8::FunctionTemplate::New(isolate);
         py::object *object = new py::object(obj);
 
         func_tmpl->SetCallHandler(Caller, v8::External::New(isolate, object));
-
-        if (PyType_Check(obj.ptr()))
-        {
-            v8::Handle<v8::String> cls_name = v8::String::NewFromUtf8(isolate, py::extract<const char *>(obj.attr("__name__"))()).ToLocalChecked();
-
-            func_tmpl->SetClassName(cls_name);
-        }
 
         result = func_tmpl->GetFunction(isolate->GetCurrentContext()).ToLocalChecked();
 
@@ -1042,11 +1250,21 @@ v8::Handle<v8::Value> CPythonObject::WrapInternal(py::object obj)
     }
     else
     {
-        static v8::Persistent<v8::ObjectTemplate> s_template(isolate, CreateObjectTemplate(isolate));
+        // Any other object (JSClass instances, dicts, ...): instantiate the
+        // cached template of its Python class so the JS prototype chain mirrors
+        // the Python MRO and `instanceof` works.
+        //
+        // Instantiate through the InstanceTemplate (NOT GetFunction()->NewInstance):
+        // the class template carries a call handler (so calling the exposed
+        // class instantiates the Python class), and Function::NewInstance would
+        // run that handler -- which re-instantiates the Python object and
+        // recurses back into Wrap. ObjectTemplate::NewInstance just allocates the
+        // object with the template's prototype chain, which is what we want.
+        py::object cls = obj.attr("__class__");
+        v8::Local<v8::FunctionTemplate> tmpl = GetClassTemplate(isolate, cls);
 
-        v8::MaybeLocal<v8::Object> instance = v8::Local<v8::ObjectTemplate>::New(
-                isolate, s_template)->NewInstance(
-                        isolate->GetCurrentContext());
+        v8::MaybeLocal<v8::Object> instance =
+            tmpl->InstanceTemplate()->NewInstance(isolate->GetCurrentContext());
 
         if (!instance.IsEmpty())
         {
@@ -1261,6 +1479,15 @@ void CJavascriptObject::Dump(std::ostream& os) const
         if(!s.IsEmpty())
             os << *v8::String::Utf8Value(isolate, s.ToLocalChecked());
     }
+}
+
+const std::string CJavascriptObject::str(void) const
+{
+    std::ostringstream oss;
+
+    Dump(oss);
+
+    return oss.str();
 }
 
 CJavascriptObject::operator long() const

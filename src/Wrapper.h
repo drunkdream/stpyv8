@@ -4,6 +4,8 @@
 #include <memory>
 #include <iostream>
 #include <map>
+#include <mutex>
+#include <unordered_map>
 #include <sstream>
 
 #include "Exception.h"
@@ -50,6 +52,24 @@ public:
 
     static void SetupObjectTemplate(v8::Isolate *isolate, v8::Handle<v8::ObjectTemplate> clazz);
     static v8::Handle<v8::ObjectTemplate> CreateObjectTemplate(v8::Isolate *isolate);
+    // Returns the ObjectTemplate belonging to `isolate`, creating (and caching)
+    // one on first use. A v8::ObjectTemplate may only be used with the isolate
+    // that created it, so it must never be shared across isolates.
+    static v8::Local<v8::ObjectTemplate> GetObjectTemplate(v8::Isolate *isolate);
+
+    // Returns (creating and caching per isolate) a FunctionTemplate modelling
+    // the given Python class. Instances get this class's prototype -- so the JS
+    // prototype chain mirrors the Python MRO and `instanceof` works -- and the
+    // class itself is exposed as the matching constructor function.
+    static v8::Local<v8::FunctionTemplate> GetClassTemplate(v8::Isolate *isolate, py::object cls);
+
+    // Exposes the Python class's own attributes (class/static attributes,
+    // classmethods, staticmethods, nested classes, ...) as own properties on the
+    // given constructor function, so that e.g. `XMLHttpRequest.UNSENT` reads the
+    // class attribute directly instead of having to be mounted by hand in JS.
+    // V8 creates one function object per context, so a fresh function in a new
+    // context is re-populated; within a context we do it only once.
+    static void PopulateStaticProperties(v8::Isolate *isolate, py::object cls, v8::Local<v8::Object> func);
 
     static v8::Handle<v8::Value> WrapInternal(py::object obj);
 
@@ -82,6 +102,17 @@ public:
     {
     }
 
+    // v8::Persistent is no longer copyable (its default traits are
+    // NonCopyablePersistentTraits), so an implicit copy constructor would
+    // instantiate the deleted Copy helper. Re-create a new persistent handle
+    // pointing at the same JS object instead.
+    CJavascriptObject(const CJavascriptObject& other)
+    {
+        v8::Isolate* isolate = v8::Isolate::GetCurrent();
+        v8::HandleScope handle_scope(isolate);
+        m_obj.Reset(isolate, other.Object());
+    }
+
     virtual ~CJavascriptObject()
     {
         m_obj.Reset();
@@ -112,12 +143,23 @@ public:
 
     void Dump(std::ostream& os) const;
 
+    // Returns the same textual representation as Dump(). Registered explicitly
+    // as Python's __str__: relying on boost::python's `str(self)` (which streams
+    // the object) picks up the implicit conversion to double instead and prints
+    // "nan" for every non-numeric value.
+    const std::string str(void) const;
+
     static py::object Wrap(CJavascriptObject *obj);
     static py::object Wrap(v8::Handle<v8::Value> value,
                            v8::Handle<v8::Object> self = v8::Handle<v8::Object>());
     static py::object Wrap(v8::Handle<v8::Object> obj,
                            v8::Handle<v8::Object> self = v8::Handle<v8::Object>());
 };
+
+// boost::python's `str(self)` streams the object. Without this overload the
+// implicit conversion to double (via `operator double()`) is selected instead,
+// which prints "nan" for every value that is not a number.
+std::ostream& operator<<(std::ostream& os, const CJavascriptObject& obj);
 
 class CJavascriptNull : public CJavascriptObject
 {

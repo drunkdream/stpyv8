@@ -12,7 +12,9 @@ V8_GIT_TAG_MASTER = "master"
 V8_GIT_TAG = V8_GIT_TAG_STABLE
 DEPOT_GIT_URL = "https://chromium.googlesource.com/chromium/tools/depot_tools.git"
 
-STPYV8_VERSION = V8_GIT_TAG_STABLE
+# Allow the wheel version to be overridden (e.g. a local patch suffix such as
+# "13.1.201.22.post1") without changing the V8 tag that gets checked out/built.
+STPYV8_VERSION = os.environ.get("STPYV8_VERSION", V8_GIT_TAG_STABLE)
 
 v8_deps_linux = os.environ.get("V8_DEPS_LINUX", "1") in ("1",)
 
@@ -33,7 +35,14 @@ gn_args = {
     "is_component_build": "false",
     "is_debug": "true" if os.environ.get("STPYV8_DEBUG") else "false",
     "treat_warnings_as_errors": "false",
-    "use_custom_libcxx": "false",
+    # On Windows the STPyV8 extension is compiled with MSVC and the MSVC STL,
+    # while V8's bundled libc++ uses the `std::__Cr` inline namespace. Any V8
+    # API whose signature contains an STL type (e.g.
+    # v8::Message::PrintCurrentStackTrace(isolate, std::ostream&) or
+    # v8::platform::NewDefaultPlatform -> std::unique_ptr) then has a different
+    # mangled name in V8 than in the extension, so linking fails. Build V8
+    # against the MSVC STL on Windows to keep both sides ABI-compatible.
+    "use_custom_libcxx": "false" if os.name == "nt" else "true",
     "v8_deprecation_warnings": "true",
     "v8_enable_disassembler": "false",
     "v8_enable_i18n_support": "true",
@@ -53,11 +62,19 @@ source_files = [
     "Wrapper.cpp",
     "Locker.cpp",
     "Utils.cpp",
+    "CrashHandler.cpp",
     "STPyV8.cpp",
 ]
 
 
-macros = [("BOOST_PYTHON_STATIC_LIB", None)]
+macros = [
+    ("BOOST_PYTHON_STATIC_LIB", None),
+    # Our Boost build uses the "system" library layout (boost_python312.lib),
+    # which does not match the versioned name Boost auto-link derives from the
+    # compiler flags. Disable auto-linking so the explicitly listed library is
+    # used instead.
+    ("BOOST_ALL_NO_LIB", None),
+]
 include_dirs = set()
 library_dirs = set()
 libraries = []
@@ -134,9 +151,29 @@ if os.name in ("nt",):
         for p in os.environ["LIB"].split(";"):
             library_dirs.add(p)
 
-    libraries += ["winmm", "ws2_32", "Advapi32", "dbghelp", "v8_monolith"]
+    libraries += [
+        "winmm",
+        "ws2_32",
+        "Advapi32",
+        "dbghelp",
+        "v8_monolith",
+        BOOST_PYTHON_LIB_LONG,
+        # Boost components used by the extension (Exception.cpp uses
+        # boost::iostreams, Platform.cpp uses boost::filesystem). Auto-linking is
+        # disabled via BOOST_ALL_NO_LIB, so they must be listed explicitly.
+        # Built with `--layout=system` so the names carry no compiler-version tag.
+        "libboost_iostreams",
+        "libboost_filesystem",
+    ]
     extra_compile_args += ["/O2", "/GL", "/MT", "/EHsc", "/Gy", "/Zi", "/std:c++20", "/Zc:__cplusplus"]
     extra_link_args += ["/DLL", "/OPT:REF", "/OPT:ICF", "/MACHINE:X64"]
+    if os.environ.get("STPYV8_PDB"):
+        # Emit a PDB so native crashes can be symbolized in WinDbg. This is
+        # independent of V8's build flavor: the extension stays a release (/MT)
+        # build linked against the release v8_monolith, and only gains symbols.
+        # (Do NOT gate this on STPYV8_DEBUG -- a debug V8 pulls in the debug CRT
+        # (_malloc_dbg/_CrtDbgReport/...) which the release extension can't link.)
+        extra_link_args += ["/DEBUG"]
     macros += [
         ("HAVE_SNPRINTF", None),
     ]

@@ -9,5 +9,7 @@ depot_tools
 v8
 switch_repo*
 *.pyc
+*.pyd
+*.pdb
 *.cmake
 .idea

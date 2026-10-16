@@ -16,7 +16,9 @@ private:
     constexpr static const char *icu_data_system = ICU_DATA_SYSTEM;
     constexpr static const char *icu_data_user = ICU_DATA_USER;
 
-    const char *GetICUDataFile();
+    // Returns the path as a std::string: returning a `const char*` obtained from
+    // a local std::string would dangle as soon as the function returns.
+    std::string GetICUDataFile();
 
     std::string argv;
 public:
