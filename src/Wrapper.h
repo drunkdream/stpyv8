@@ -5,6 +5,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <sstream>
 
@@ -74,6 +75,17 @@ public:
     static v8::Handle<v8::Value> WrapInternal(py::object obj);
 
     static bool IsWrapped(v8::Handle<v8::Object> obj);
+
+    // True when the Python type of `obj` lists `name` in `__js_hidden__`.
+    // Such names are reported to JS as if they did not exist, which is the only
+    // way to keep a Python attribute private: the named-property interceptors
+    // forward the requested name verbatim to PyObject_GetAttrString /
+    // PyObject_HasAttrString / PyObject_DelAttrString, i.e. JS is given exactly
+    // the attribute access that Python's getattr()/hasattr()/delattr() have --
+    // including Python's private-name mangling, which is a collision-avoidance
+    // convention rather than an access control.
+    static bool IsJsHiddenName(PyObject *obj, const std::string& name);
+
     static v8::Handle<v8::Value> Wrap(py::object obj);
     static py::object Unwrap(v8::Handle<v8::Object> obj);
     static void Dispose(v8::Handle<v8::Value> value);

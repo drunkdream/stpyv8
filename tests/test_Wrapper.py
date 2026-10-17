@@ -1055,6 +1055,89 @@ class TestWrapper(unittest.TestCase):
             self.assertEqual(10, ctxt.eval("obj.p"))
             self.assertEqual(10, ctxt.locals.d["y"])
 
+    def testJsHidden(self):
+        class History(STPyV8.JSClass):
+            # `self.__stack` is stored as `_History__stack` by Python's private
+            # name mangling, and the class name is public -- so without the list
+            # below JS could read *and write* the attribute as
+            # `h._History__stack`.
+            __js_hidden__ = ("_History__stack", "_History__idx")
+
+            def __init__(self):
+                self.__stack = []
+                self.__idx = 0
+                self.length = 0
+
+            def push(self, value):
+                self.__stack.append(value)
+                self.__idx += 1
+                self.length = self.__idx
+
+            def peek(self):
+                return self.__stack[self.__idx - 1]
+
+        class Global(STPyV8.JSClass):
+            def __init__(self):
+                self.h = History()
+
+        global_ = Global()
+
+        with STPyV8.JSContext(global_) as ctxt:
+            ctxt.eval("h.push('a'); h.push('b');")
+
+            # Python keeps full access to the mangled attributes.
+            self.assertEqual(["a", "b"], global_.h._History__stack)
+            self.assertEqual(2, global_.h._History__idx)
+            self.assertEqual("b", global_.h.peek())
+
+            # JS cannot see them.
+            self.assertEqual("undefined", ctxt.eval("typeof h._History__stack"))
+            self.assertEqual("undefined", ctxt.eval("typeof h._History__idx"))
+            self.assertEqual(False, ctxt.eval("'_History__stack' in h"))
+            self.assertNotIn("_History__stack", convert(ctxt.eval("Object.keys(h)")))
+
+            # JS cannot write them either -- the assignment is silently dropped.
+            ctxt.eval("h._History__stack = ['tampered']; h._History__idx = 99;")
+            self.assertEqual(["a", "b"], global_.h._History__stack)
+            self.assertEqual(2, global_.h._History__idx)
+
+            # ... nor delete them.
+            self.assertEqual(False, ctxt.eval("delete h._History__stack"))
+            self.assertEqual(["a", "b"], global_.h._History__stack)
+
+            # The public API keeps working from JS.
+            self.assertEqual("b", ctxt.eval("h.peek()"))
+            self.assertEqual(2, ctxt.eval("h.length"))
+
+    def testJsHiddenInherited(self):
+        class Base(STPyV8.JSClass):
+            __js_hidden__ = ("_Base__secret",)
+
+            def __init__(self):
+                self.__secret = "base"
+
+        class Derived(Base):
+            def __init__(self):
+                Base.__init__(self)
+
+                # mangled to `_Derived__own`, which is *not* listed anywhere
+                self.__own = "own"
+
+        class Global(STPyV8.JSClass):
+            def __init__(self):
+                self.d = Derived()
+
+        global_ = Global()
+
+        with STPyV8.JSContext(global_) as ctxt:
+            # inherited from the base class
+            self.assertEqual("undefined", ctxt.eval("typeof d._Base__secret"))
+            self.assertEqual(False, ctxt.eval("'_Base__secret' in d"))
+
+            # not listed, so still reachable -- the list is a gate, not a filter
+            self.assertEqual("own", ctxt.eval("d._Derived__own"))
+            self.assertEqual("base", global_.d._Base__secret)
+
     def testWatch(self):
         class Obj(STPyV8.JSClass):
             def __init__(self):

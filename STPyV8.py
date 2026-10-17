@@ -196,6 +196,22 @@ class JSClass:
     __properties__ = {}
     __watchpoints__ = {}
 
+    # Names listed here are invisible to JS: reading one yields `undefined`,
+    # writing one is silently dropped, `'name' in obj` is `False`, `delete` fails,
+    # and the name is left out of `Object.keys()` / `for..in`.
+    #
+    # This is the *only* way to keep an attribute private. The named-property
+    # interceptors hand the requested name to `PyObject_GetAttrString`, which is
+    # exactly what Python's `getattr()` uses, so JS otherwise gets the same
+    # attribute access as Python -- including private-name mangling. `self.__x`
+    # inside `class History` is stored as `_History__x`, and because the class
+    # name is public (`h.constructor.name`, or just the source) a script only has
+    # to spell `h._History__x` to read *and write* it. Underscores are a naming
+    # convention, not a gate; this list is a gate.
+    #
+    # Subclasses union their own list with the ones inherited along the MRO.
+    __js_hidden__ = ()
+
     def __getattr__(self, name):
         if name == "constructor":
             return JSClassConstructor(self.__class__)

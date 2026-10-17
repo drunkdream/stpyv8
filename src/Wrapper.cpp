@@ -280,6 +280,98 @@ CPythonObject::~CPythonObject()
 {
 }
 
+namespace
+{
+// Resolves the set of attribute names a Python class keeps out of reach of JS.
+// A class declares them in `__js_hidden__` (any iterable of strings); the lists
+// found along the whole MRO are unioned, base-most first, so a subclass inherits
+// its bases' decisions and its own list is applied last.
+std::set<std::string> ResolveJsHiddenNames(py::object cls)
+{
+    std::set<std::string> hidden;
+
+    PyObject *mro = ::PyObject_GetAttrString(cls.ptr(), "__mro__");
+
+    if (mro && PyTuple_Check(mro))
+    {
+        Py_ssize_t count = PyTuple_GET_SIZE(mro);
+
+        // Base-most first, so a subclass's own list is applied last.
+        for (Py_ssize_t i = count - 1; i >= 0; --i)
+        {
+            py::object base(py::borrowed<>(PyTuple_GET_ITEM(mro, i)));
+
+            if (!::PyObject_HasAttrString(base.ptr(), "__js_hidden__"))
+                continue;
+
+            py::object names(base.attr("__js_hidden__"));
+
+            PyObject *iter = ::PyObject_GetIter(names.ptr());
+
+            if (!iter)
+            {
+                ::PyErr_Clear();
+                continue;
+            }
+
+            PyObject *item = NULL;
+
+            while (NULL != (item = ::PyIter_Next(iter)))
+            {
+                // `= py::object(...)` and not `py::object entry(...)`, which the
+                // compiler would read as a function declaration.
+                py::object entry = py::object(py::handle<>(item));
+
+                if (PyUnicode_Check(entry.ptr()) || PyBytes_Check(entry.ptr()))
+                    hidden.insert(py::extract<std::string>(entry));
+            }
+
+            // A broken iterable leaves an error set; the declaration list is not
+            // worth propagating that, so drop it and keep what was collected.
+            ::PyErr_Clear();
+
+            ::Py_DECREF(iter);
+        }
+    }
+
+    ::Py_XDECREF(mro);
+
+    return hidden;
+}
+}  // namespace
+
+bool CPythonObject::IsJsHiddenName(PyObject *obj, const std::string& name)
+{
+    if (obj == nullptr || !PyType_Check(Py_TYPE(obj)))
+        return false;
+
+    PyTypeObject *type = Py_TYPE(obj);
+
+    // `__js_hidden__` is a class-level constant, so the merged list only has to
+    // be built once per type. Every interceptor holds the GIL when it gets here,
+    // which already serialises this cache; the mutex only guards against a
+    // future caller that does not.
+    static std::mutex s_mutex;
+
+    // The type object is kept alive by the cache entry so that its address stays
+    // a valid key (same reasoning as the per-isolate caches in
+    // GetObjectTemplate / GetClassTemplate).
+    static std::unordered_map<PyTypeObject *, std::pair<py::object, std::set<std::string>>> s_cache;
+
+    std::lock_guard<std::mutex> lock(s_mutex);
+
+    auto it = s_cache.find(type);
+
+    if (it == s_cache.end())
+    {
+        py::object cls(py::borrowed<>(reinterpret_cast<PyObject *>(type)));
+
+        it = s_cache.emplace(type, std::make_pair(cls, ResolveJsHiddenNames(cls))).first;
+    }
+
+    return it->second.second.find(name) != it->second.second.end();
+}
+
 v8::Intercepted CPythonObject::NamedGetter(v8::Local<v8::Name> prop, const v8::PropertyCallbackInfo<v8::Value>& info)
 {
     v8::HandleScope handle_scope(info.GetIsolate());
@@ -304,6 +396,11 @@ v8::Intercepted CPythonObject::NamedGetter(v8::Local<v8::Name> prop, const v8::P
         if (prop_name == "constructor" || prop_name == "prototype")
             CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Value>());
     }
+
+    // Names the class listed in `__js_hidden__` do not exist as far as JS is
+    // concerned, so Python-internal state stays unreachable from scripts.
+    if (CPythonObject::IsJsHiddenName(obj.ptr(), *name))
+        CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Value>());
 
     PyObject *value = ::PyObject_GetAttrString(obj.ptr(), *name);
 
@@ -378,6 +475,12 @@ v8::Intercepted CPythonObject::NamedSetter(v8::Local<v8::Name> prop, v8::Local<v
     if (*name == nullptr)
         CALLBACK_RETURN_NOT_HANDLED(v8::Undefined(info.GetIsolate()));
 
+    // A hidden name is not writable either: report the assignment as handled so
+    // that it is silently dropped, exactly like assigning to a non-writable
+    // property in sloppy mode.
+    if (CPythonObject::IsJsHiddenName(obj.ptr(), *name))
+        CALLBACK_RETURN_HANDLED(value);
+
     py::object newval = CJavascriptObject::Wrap(value);
 
     bool found = 1 == ::PyObject_HasAttrString(obj.ptr(), *name);
@@ -439,6 +542,10 @@ v8::Intercepted CPythonObject::NamedQuery(v8::Local<v8::Name> prop, const v8::Pr
 
     v8::String::Utf8Value name(info.GetIsolate(), prop);
 
+    // Hidden names must not answer the `in` operator either.
+    if (*name && CPythonObject::IsJsHiddenName(obj.ptr(), *name))
+        CALLBACK_RETURN_NOT_HANDLED(v8::Integer::New(info.GetIsolate(), v8::None));
+
     if (*name)
     {
         int rc;
@@ -494,6 +601,10 @@ v8::Intercepted CPythonObject::NamedDeleter(v8::Local<v8::Name> prop, const v8::
     v8::String::Utf8Value name(info.GetIsolate(), v8::Local<v8::String>::Cast(prop));
     if (*name == nullptr)
         CALLBACK_RETURN_NOT_HANDLED(v8::False(info.GetIsolate()));
+
+    // `delete` on a hidden name reports failure and touches nothing.
+    if (CPythonObject::IsJsHiddenName(obj.ptr(), *name))
+        CALLBACK_RETURN_HANDLED(v8::False(info.GetIsolate()));
 
     if (!::PyObject_HasAttrString(obj.ptr(), *name) &&
             ::PyMapping_Check(obj.ptr()))
@@ -587,6 +698,15 @@ void CPythonObject::NamedEnumerator(const v8::PropertyCallbackInfo<v8::Array>& i
         for (Py_ssize_t i=0; i<len; i++)
         {
             PyObject *item = PyList_GET_ITEM(keys.ptr(), i);
+
+            // Hidden names never show up in Object.keys() / for..in either.
+            if (PyUnicode_Check(item) || PyBytes_Check(item))
+            {
+                py::str name(py::handle<>(py::borrowed(item)));
+
+                if (CPythonObject::IsJsHiddenName(obj.ptr(), py::extract<std::string>(name)))
+                    continue;
+            }
 
             if (filter_name && PyBytes_CheckExact(item))
             {
