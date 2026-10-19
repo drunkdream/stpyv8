@@ -1221,17 +1221,11 @@ v8::Handle<v8::Value> CPythonObject::Wrap(py::object obj)
 {
     v8::EscapableHandleScope handle_scope(v8::Isolate::GetCurrent());
 
-    v8::Local<v8::Value> value;
-
-#ifdef SUPPORT_TRACE_LIFECYCLE
-    value = ObjectTracer::FindCache(obj);
-
-    if (value.IsEmpty())
-#endif
-
-        value = WrapInternal(obj);
-
-    return handle_scope.Escape(value);
+    // NOTE: the living-map lookup deliberately lives inside WrapInternal, *after*
+    // the CJavascriptObject branch. A CJavascriptObject already has a JS identity
+    // of its own and must be handed back as-is; consulting the cache for it used
+    // to return a stand-in proxy instead (see the comment there).
+    return handle_scope.Escape(WrapInternal(obj));
 }
 
 v8::Handle<v8::Value> CPythonObject::WrapInternal(py::object obj)
@@ -1271,23 +1265,35 @@ v8::Handle<v8::Value> CPythonObject::WrapInternal(py::object obj)
             throw CJavascriptException("Refer to a null object", ::PyExc_AttributeError);
         }
 
-#ifdef SUPPORT_TRACE_LIFECYCLE
-        v8::MaybeLocal<v8::Object> instance = GetObjectTemplate(isolate)->NewInstance(
-                        isolate->GetCurrentContext());
-
-        if (!instance.IsEmpty())
-        {
-            py::object *object = new py::object(obj);
-
-            v8::Handle<v8::Object> realInstance = instance.ToLocalChecked();
-            realInstance->SetInternalField(0, v8::External::New(isolate, object));
-
-            ObjectTracer::Trace(instance.ToLocalChecked(), object);
-        }
-#endif
-
+        // A CJavascriptObject already *is* a JS object, so hand back the very
+        // object it wraps -- never a stand-in for it.
+        //
+        // This branch used to mint a fresh proxy from GetObjectTemplate and
+        // register it in the living map, while still returning the real object.
+        // Because Wrap() consults that map first, every wrap after the first
+        // returned the proxy: a Python-backed object reporting
+        // `typeof "function"` and `instanceof Set === false`, whose inherited
+        // methods failed with "incompatible receiver". The proxy was only weakly
+        // referenced, so whether a given read hit the cache depended on GC
+        // timing -- hence the intermittency.
+        //
+        // That is what broke React 17's getEventListenerSet(), which stores a
+        // native Set on a DOM node and reads it back on the very next event.
+        // Objects nested inside a plain JS object were spared because reading
+        // them is a pure V8 load that never round-trips through Python.
         return handle_scope.Escape(jsobj.Object());
     }
+
+#ifdef SUPPORT_TRACE_LIFECYCLE
+    // Everything below mints a JS object for a Python object that has no JS
+    // identity of its own. Reuse the one handed out before so that
+    // `Wrap(x) === Wrap(x)` (stable identity for constructors, functions and
+    // JSClass instances).
+    v8::Local<v8::Value> cached = ObjectTracer::FindCache(obj);
+
+    if (!cached.IsEmpty())
+        return handle_scope.Escape(cached);
+#endif
 
     v8::Local<v8::Value> result;
 

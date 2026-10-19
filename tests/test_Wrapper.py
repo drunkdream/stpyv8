@@ -1138,6 +1138,69 @@ class TestWrapper(unittest.TestCase):
             self.assertEqual("own", ctxt.eval("d._Derived__own"))
             self.assertEqual("base", global_.d._Base__secret)
 
+    def testNativeObjectIdentity(self):
+        class Element(STPyV8.JSClass):
+            def createElement(self, tag):
+                return Element()
+
+        class Window(STPyV8.JSClass):
+            def __init__(self):
+                self.document = Element()
+
+        window = Window()
+
+        with STPyV8.JSContext(window) as ctxt:
+            node = ctxt.eval("document.createElement('div')")
+            window.node = node
+
+            ctxt.eval(
+                """
+            var marker = '__reactEvents$1';
+
+            function getEventListenerSet(target) {
+                var s = target[marker];
+                if (s === undefined) { s = new Set(); target[marker] = s; }
+                return s;
+            }
+
+            function dispatch(target, key) {
+                var s = getEventListenerSet(target);
+                if (s.has(key)) return 'duplicate';
+                s.add(key);
+                return 'added';
+            }
+            """
+            )
+
+            # React 17's getEventListenerSet() stores a native Set on a DOM node
+            # and reads it back on the very next event. A JS object held as a
+            # direct attribute of a JSClass must come back as *itself* -- the
+            # second read used to return a Python-backed stand-in (typeof
+            # "function", instanceof false, inherited methods failing with
+            # "incompatible receiver"), which is what broke the SPA render.
+            self.assertEqual("added", ctxt.eval("dispatch(node, 'click')"))
+            self.assertEqual("duplicate", ctxt.eval("dispatch(node, 'click')"))
+            self.assertEqual("added", ctxt.eval("dispatch(node, 'hover')"))
+
+            self.assertEqual(True, ctxt.eval("node[marker] instanceof Set"))
+            self.assertEqual("object", ctxt.eval("typeof node[marker]"))
+            self.assertEqual(2, ctxt.eval("node[marker].size"))
+
+            # ... and it keeps its own type-specific behaviour.
+            ctxt.eval("node.list = [1, 2];")
+            self.assertEqual(True, ctxt.eval("Array.isArray(node.list)"))
+            self.assertEqual(True, ctxt.eval("node.list === node.list"))
+
+            ctxt.eval("node.map = new Map([['k', 7]]);")
+            self.assertEqual(True, ctxt.eval("node.map instanceof Map"))
+            self.assertEqual(7, ctxt.eval("node.map.get('k')"))
+
+            # Objects nested inside a plain JS object never round-trip through
+            # Python, so they were always fine.
+            ctxt.eval("node.holder = { s: new Set([1]) };")
+            self.assertEqual(True, ctxt.eval("node.holder.s instanceof Set"))
+            self.assertEqual(True, ctxt.eval("node.holder.s.has(1)"))
+
     def testWatch(self):
         class Obj(STPyV8.JSClass):
             def __init__(self):
