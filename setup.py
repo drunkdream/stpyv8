@@ -195,6 +195,34 @@ class stpyv8_bdist_wheel(bdist_wheel):
 
         bdist_wheel.run(self)
 
+    def _drop_debug_symbols(self):
+        """Remove *.pdb from the wheel staging tree.
+
+        With STPYV8_PDB (build.py --debug) link.exe writes <ext>.pdb next to the
+        .pyd inside build/lib*, and 'install' copies it into bdist_dir, so the
+        wheel would ship hundreds of megabytes of debug symbols. The .pyd keeps
+        its embedded PDB path either way, so dropping the file costs nothing.
+        """
+        if self.dry_run or not self.bdist_dir or not os.path.isdir(self.bdist_dir):
+            return
+
+        for root, _dirs, files in os.walk(self.bdist_dir):
+            for name in files:
+                if not name.lower().endswith(".pdb"):
+                    continue
+
+                path = os.path.join(root, name)
+                os.remove(path)
+                print(f"excluding debug symbols from the wheel: {path}")
+
+    def write_wheelfile(self, wheelfile_base, *args, **kwargs):
+        # Called by bdist_wheel.run after 'install' has staged every file and
+        # before the archive (and therefore RECORD) is produced, so a symbol file
+        # removed here never reaches the wheel.
+        self._drop_debug_symbols()
+
+        return bdist_wheel.write_wheelfile(self, wheelfile_base, *args, **kwargs)
+
 
 class stpyv8_build(build_ext):
     def run(self):
