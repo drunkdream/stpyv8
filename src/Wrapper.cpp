@@ -338,6 +338,110 @@ std::set<std::string> ResolveJsHiddenNames(py::object cls)
 
     return hidden;
 }
+
+// True when `name` resolves to a *real* (non-interceptor) property on one of the
+// prototypes between `holder` and the root prototype -- e.g. one installed
+// through Object.defineProperty(Element.prototype, "scrollTop", {...}).
+//
+// This must be consulted *before* the Python attribute lookup in every named
+// interceptor, not after it. The interceptors installed on the instance template
+// are masking: as soon as one reports a property as handled, V8 stops and never
+// walks the prototype chain. So a prototype accessor stays unreachable whenever
+// Python happens to expose an attribute of the same name -- the getter would
+// answer with the Python value (scrollTop -> 0) while the write still reached
+// the prototype setter, i.e. reads and writes would disagree. Checking the
+// prototype first is what makes a polyfill's redefinition of e.g.
+// Element.prototype.scrollTop take effect on instance access, exactly as in a
+// browser.
+//
+// The root prototype (Object.prototype) is deliberately skipped: its built-ins
+// (toString, valueOf, hasOwnProperty, ...) must never shadow a Python attribute
+// of the same name. The chain is walked with HasRealNamedProperty, which looks
+// at real own properties only and never invokes an accessor.
+static bool HasRealPrototypeProperty(v8::Local<v8::Object> holder,
+                                    v8::Local<v8::Name> name,
+                                    v8::Isolate *isolate)
+{
+    v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
+
+    v8::Local<v8::Value> protoVal = holder->GetPrototype();
+
+    while (protoVal->IsObject())
+    {
+        v8::Local<v8::Object> proto = protoVal.As<v8::Object>();
+
+        // The root prototype is the last one that still has a prototype of its
+        // own; everything it carries is a built-in and is not ours to prefer.
+        if (!proto->GetPrototype()->IsObject())
+            break;
+
+        v8::Maybe<bool> has = proto->HasRealNamedProperty(ctx, name);
+
+        if (has.IsJust() && has.FromJust())
+            return true;
+
+        protoVal = proto->GetPrototype();
+    }
+
+    return false;
+}
+
+// If `name` is a genuine accessor (installed e.g. via Object.defineProperty on
+// the prototype) that has a setter, return that setter function so the named
+// setter can forward the assignment to it. Returning kNo from the named setter
+// would make V8 create a fresh own property on the instance instead of invoking
+// the prototype accessor -- which is exactly what would stop a polyfill's
+// redefinition of e.g. Element.prototype.scrollTop from taking effect on writes.
+static v8::MaybeLocal<v8::Function> GetRealPrototypeSetter(v8::Local<v8::Object> holder,
+                                                          v8::Local<v8::Name> name,
+                                                          v8::Isolate *isolate)
+{
+    v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
+
+    v8::Local<v8::Value> protoVal = holder->GetPrototype();
+
+    while (protoVal->IsObject())
+    {
+        v8::Local<v8::Object> proto = protoVal.As<v8::Object>();
+
+        // Same boundary as HasRealPrototypeProperty: Object.prototype's
+        // built-ins are not a target for forwarding a write.
+        if (!proto->GetPrototype()->IsObject())
+            break;
+
+        v8::Maybe<bool> has = proto->HasRealNamedProperty(ctx, name);
+
+        if (has.IsJust() && has.FromJust())
+        {
+            v8::MaybeLocal<v8::Value> maybeDesc = proto->GetOwnPropertyDescriptor(ctx, name);
+
+            if (!maybeDesc.IsEmpty())
+            {
+                v8::Local<v8::Value> desc = maybeDesc.ToLocalChecked();
+
+                if (desc->IsObject())
+                {
+                    v8::MaybeLocal<v8::Value> maybeSetter =
+                        desc.As<v8::Object>()->Get(ctx, v8::String::NewFromUtf8(isolate, "set", v8::NewStringType::kNormal).ToLocalChecked());
+
+                    if (!maybeSetter.IsEmpty())
+                    {
+                        v8::Local<v8::Value> setter = maybeSetter.ToLocalChecked();
+
+                        if (setter->IsFunction())
+                            return setter.As<v8::Function>();
+                    }
+                }
+            }
+            // Real property found but not a settable accessor: stop searching.
+            return v8::MaybeLocal<v8::Function>();
+        }
+
+        protoVal = proto->GetPrototype();
+    }
+
+    return v8::MaybeLocal<v8::Function>();
+}
 }  // namespace
 
 bool CPythonObject::IsJsHiddenName(PyObject *obj, const std::string& name)
@@ -400,6 +504,15 @@ v8::Intercepted CPythonObject::NamedGetter(v8::Local<v8::Name> prop, const v8::P
     // Names the class listed in `__js_hidden__` do not exist as far as JS is
     // concerned, so Python-internal state stays unreachable from scripts.
     if (CPythonObject::IsJsHiddenName(obj.ptr(), *name))
+        CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Value>());
+
+    // A genuine property on a class prototype -- e.g. the accessor installed by
+    // Object.defineProperty(Element.prototype, "scrollTop", {...}) -- outranks
+    // the catch-all Python lookup, so step aside *before* asking Python. Doing
+    // this afterwards would leave the Python attribute masking the prototype
+    // accessor: reads would return the Python value while writes still reached
+    // the prototype setter.
+    if (HasRealPrototypeProperty(info.Holder(), prop, info.GetIsolate()))
         CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Value>());
 
     PyObject *value = ::PyObject_GetAttrString(obj.ptr(), *name);
@@ -481,6 +594,28 @@ v8::Intercepted CPythonObject::NamedSetter(v8::Local<v8::Name> prop, v8::Local<v
     if (CPythonObject::IsJsHiddenName(obj.ptr(), *name))
         CALLBACK_RETURN_HANDLED(value);
 
+    // A real accessor installed on the prototype (e.g. via
+    // Object.defineProperty(Element.prototype, "scrollTop", {...})) must receive
+    // the write: returning kNo from the named setter would make V8 create a fresh
+    // own property on the instance and never call the prototype accessor's setter,
+    // which is exactly what would stop a polyfill's redefinition from taking
+    // effect on instance writes. We only forward when there is a genuine setter;
+    // for data properties and get-only accessors we fall through to the normal
+    // Python attribute path so built-ins keep their existing assignment behaviour.
+    if (HasRealPrototypeProperty(info.Holder(), prop, info.GetIsolate()))
+    {
+        v8::MaybeLocal<v8::Function> setter =
+            GetRealPrototypeSetter(info.Holder(), prop, info.GetIsolate());
+
+        if (!setter.IsEmpty())
+        {
+            v8::Local<v8::Value> argv[] = { value };
+            setter.ToLocalChecked()->Call(info.GetIsolate()->GetCurrentContext(),
+                                          info.Holder(), 1, argv);
+            CALLBACK_RETURN_HANDLED(value);
+        }
+    }
+
     py::object newval = CJavascriptObject::Wrap(value);
 
     bool found = 1 == ::PyObject_HasAttrString(obj.ptr(), *name);
@@ -546,6 +681,12 @@ v8::Intercepted CPythonObject::NamedQuery(v8::Local<v8::Name> prop, const v8::Pr
     if (*name && CPythonObject::IsJsHiddenName(obj.ptr(), *name))
         CALLBACK_RETURN_NOT_HANDLED(v8::Integer::New(info.GetIsolate(), v8::None));
 
+    // Same precedence as the getter: a real prototype property answers `in` and
+    // ownership itself. Claiming the Python attribute here would make V8
+    // synthesise a data descriptor for an inherited accessor.
+    if (*name && HasRealPrototypeProperty(info.Holder(), prop, info.GetIsolate()))
+        CALLBACK_RETURN_NOT_HANDLED(v8::Integer::New(info.GetIsolate(), v8::None));
+
     if (*name)
     {
         int rc;
@@ -605,6 +746,12 @@ v8::Intercepted CPythonObject::NamedDeleter(v8::Local<v8::Name> prop, const v8::
     // `delete` on a hidden name reports failure and touches nothing.
     if (CPythonObject::IsJsHiddenName(obj.ptr(), *name))
         CALLBACK_RETURN_HANDLED(v8::False(info.GetIsolate()));
+
+    // Deleting a name that resolves to a real prototype property succeeds as a
+    // no-op, exactly like `delete el.scrollTop` in a browser -- the Python
+    // attribute behind it must not be deleted instead.
+    if (HasRealPrototypeProperty(info.Holder(), prop, info.GetIsolate()))
+        CALLBACK_RETURN_HANDLED(v8::True(info.GetIsolate()));
 
     if (!::PyObject_HasAttrString(obj.ptr(), *name) &&
             ::PyMapping_Check(obj.ptr()))

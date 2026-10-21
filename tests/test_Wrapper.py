@@ -1138,6 +1138,92 @@ class TestWrapper(unittest.TestCase):
             self.assertEqual("own", ctxt.eval("d._Derived__own"))
             self.assertEqual("base", global_.d._Base__secret)
 
+    def testRealPrototypeAccessorWins(self):
+        # Mirrors the scroll-behavior-polyfill fix: a property that belongs on the
+        # prototype as a genuine accessor (scrollTop in real browsers) is defined
+        # there via Object.defineProperty. The instance interceptor must step
+        # aside so the prototype accessor actually fires on instance access,
+        # instead of shadowing it with the catch-all Python lookup.
+        class Widget(STPyV8.JSClass):
+            def __init__(self):
+                self._v = 1
+                self._top = 0
+
+            # A Python attribute of the same name as the prototype accessor:
+            # this is the case the interceptor used to swallow on reads.
+            @property
+            def top(self):
+                return self._top
+
+            @top.setter
+            def top(self, value):
+                self._top = value
+
+            def toString(self):
+                return "py-toString"
+
+        class Global(STPyV8.JSClass):
+            def __init__(self):
+                self.Widget = Widget
+                self.w = Widget()
+
+        global_ = Global()
+
+        with STPyV8.JSContext(global_) as ctxt:
+            ctxt.eval(
+                """
+                var hits = {get: 0, set: 0};
+                Object.defineProperty(Widget.prototype, 'v', {
+                    configurable: true,
+                    get: function () { hits.get++; return this._v; },
+                    set: function (x) { hits.set++; this._v = x; }
+                });
+                Object.defineProperty(Widget.prototype, 'top', {
+                    configurable: true,
+                    get: function () { return 42; },
+                    set: function (x) { this._top = x * 10; }
+                });
+                """
+            )
+
+            # The prototype now carries a real accessor whose .set is a function,
+            # so a polyfill's getOwnPropertyDescriptor(...).set won't crash.
+            self.assertEqual(
+                "function",
+                ctxt.eval("typeof (Object.getOwnPropertyDescriptor(Widget.prototype, 'v') || {}).set"),
+            )
+
+            # Instance reads/writes route to the prototype accessor -- its
+            # getter/setter are actually invoked, not shadowed by the interceptor.
+            self.assertEqual(1, ctxt.eval("w.v"))
+            self.assertEqual(1, ctxt.eval("hits.get"))
+
+            ctxt.eval("w.v = 5;")
+            self.assertEqual(1, ctxt.eval("hits.set"))
+            self.assertEqual(5, ctxt.eval("w.v"))
+
+            # Python still sees the change through the backing field.
+            self.assertEqual(5, global_.w._v)
+
+            # Reads of a name Python also exposes must reach the prototype
+            # accessor (42, not the Python value 0), and writes must reach its
+            # setter (which stores into the Python backing field).
+            self.assertEqual(42, ctxt.eval("w.top"))
+            self.assertTrue(ctxt.eval("'top' in w"))
+
+            ctxt.eval("w.top = 7;")
+            self.assertEqual(70, global_.w._top)
+            self.assertEqual(42, ctxt.eval("w.top"))
+
+            # `delete` of an inherited accessor is a successful no-op: it must
+            # not delete the Python attribute behind it.
+            self.assertTrue(ctxt.eval("delete w.top"))
+            self.assertEqual(70, global_.w._top)
+
+            # Object.prototype built-ins are not treated as class prototypes,
+            # so they keep losing to a Python attribute of the same name.
+            self.assertEqual("py-toString", ctxt.eval("w.toString()"))
+
     def testNativeObjectIdentity(self):
         class Element(STPyV8.JSClass):
             def createElement(self, tag):
