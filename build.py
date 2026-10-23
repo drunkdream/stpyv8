@@ -41,6 +41,7 @@ Examples
     python build.py --v8-home /opt/v8 --boost-root /opt/boost_1_87_0
     python build.py --python C:\\py39\\python.exe --python C:\\py312\\python.exe
     python build.py --debug
+    python build.py --docker --wheel        # build inside the stpyv8-builder container
 """
 
 import argparse
@@ -57,6 +58,14 @@ IS_MACOS = sys.platform == "darwin"
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 V8_OUT_REL = os.path.join("out.gn", "x64.release.sample")
+
+# Container layout, shared with docker/entrypoint.sh: the repository is mounted at
+# /stpyv8 (sources + collected .so/wheels) and the V8/Boost/depot_tools tree at
+# /work (built once on the host, then reused across container runs).
+DOCKER_IMAGE = "stpyv8-builder"
+DOCKER_DIR = os.path.join(REPO_ROOT, "docker")
+CONTAINER_REPO = "/stpyv8"
+CONTAINER_BUILD_ROOT = "/work"
 
 # PATH as it was before importing settings.py (whose import rewrites PATH with a
 # hard-coded separator, which is wrong on Windows).
@@ -194,10 +203,12 @@ class Config:
         self.jobs = args.jobs
         self.fetch_v8 = args.fetch_v8
         self.run_build_deps = args.run_build_deps
+        self.no_sysroot = args.no_sysroot
         self.windows_sdk_version = args.windows_sdk_version
         self.vs_install = args.vs_install or default_vs_install()
         self.version = args.version
         self.debug = args.debug
+        self.clean = args.clean
 
         self.settings = None
         self._gn_args_override = args.gn_args
@@ -337,14 +348,23 @@ class Config:
     def gn_args(self):
         if self._gn_args_override:
             return self._gn_args_override
-        return self.settings.GN_ARGS
+        args = self.settings.GN_ARGS
+        if self.no_sysroot:
+            # Build against the host system libraries instead of the extracted
+            # sysroot, which cannot be unpacked on NTFS/exFAT (see --no-sysroot).
+            if "use_sysroot" not in args:
+                args = args + " use_sysroot=false"
+        return args
 
 
 # ---------------------------------------------------------------------------
 # Steps
 # ---------------------------------------------------------------------------
 def ensure_python_deps(python):
-    packages = ["setuptools", "wheel", "pytest"]
+    # importlib_resources is STPyV8's runtime dep on Python < 3.10 (setup.py:
+    # `importlib_resources; python_version < '3.10'`); the tests import STPyV8,
+    # so make sure it is installed for every interpreter.
+    packages = ["setuptools", "wheel", "pytest", "importlib_resources"]
     # uv-managed interpreters reject pip installs unless --break-system-packages is
     # given, so we try a plain install first and fall back to that flag. The failed
     # attempt's output is captured so the noisy externally-managed error is not
@@ -366,16 +386,200 @@ def ensure_python_deps(python):
             log("    " + line)
 
 
+def _system_tool_hint(tool):
+    """Best-effort, per-distro install hint for a missing system tool."""
+    if IS_MACOS:
+        return "Install it with: brew install {}".format(tool)
+    if IS_LINUX:
+        if os.path.isfile("/etc/debian_version"):
+            return "Install it with: sudo apt install {}".format(tool)
+        if os.path.isfile("/etc/redhat-release"):
+            return "Install it with: sudo dnf install {} (or yum)".format(tool)
+        if os.path.isfile("/etc/arch-release"):
+            return "Install it with: sudo pacman -S {}".format(tool)
+        if os.path.isfile("/etc/alpine-release"):
+            return "Install it with: sudo apk add {}".format(tool)
+    return "Install '{}' and make sure it is on PATH.".format(tool)
+
+
+def _python_dev_hint(version):
+    """Human-readable 'install this' hint for missing CPython dev headers."""
+    if IS_LINUX and os.path.isfile("/etc/debian_version"):
+        return (
+            "Install the CPython development headers:\n"
+            "  sudo apt install python{ver}-dev libpython{ver}-dev\n"
+            "(Debian/Ubuntu split the headers across packages; the multiarch "
+            "pyconfig.h under /usr/include/<triplet>/python{ver}/ ships in "
+            "libpython{ver}-dev).".format(ver=version)
+        )
+    if IS_LINUX:
+        return (
+            "Install the CPython development headers (python{ver}-devel on RPM "
+            "distros, python{ver}-dev on Debian/Ubuntu).".format(ver=version)
+        )
+    if IS_MACOS:
+        return (
+            "Install the CPython development headers for Python {ver} (the "
+            "python.org installer or brew provide them; Xcode CLT required).".format(
+                ver=version
+            )
+        )
+    return "Install the CPython development headers for Python {}.".format(version)
+
+
+def ensure_python_dev(cfg, python):
+    """Verify the interpreter's C development headers are actually usable.
+
+    On Debian/Ubuntu the Python headers are split across packages and
+    /usr/include/pythonX.Y/pyconfig.h pulls in
+    <triplet>/pythonX.Y/pyconfig.h (from libpythonX.Y-dev). When that package is
+    missing the failure only surfaces much later, inside setup.py build_ext, as
+    an obscure 'pyconfig.h: No such file' error. Probe it here with a tiny
+    compile so we can fail early with an actionable 'install X' message.
+    """
+    version = cfg.python_version(python)
+    probe = (
+        "import sysconfig, subprocess, tempfile, os, sys;"
+        "inc = sysconfig.get_path('include');"
+        "plat = sysconfig.get_path('platinclude') or inc;"
+        "cc = (sysconfig.get_config_var('CC') or 'cc').split();"
+        "cf = (sysconfig.get_config_var('CFLAGS') or '').split();"
+        "d = tempfile.mkdtemp();"
+        "s = os.path.join(d, 't.c');"
+        "f = open(s, 'w');"
+        "f.write('#include <Python.h>\\nint main(void){return 0;}\\n');"
+        "f.close();"
+        "o = os.path.join(d, 't.o');"
+        "cmd = cc + ['-I' + inc, '-I' + plat] + cf + ['-c', s, '-o', o];"
+        "r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True);"
+        "sys.stdout.write('HEADERS_OK' if r.returncode == 0 else 'HEADERS_MISSING\\n' + r.stdout)"
+    )
+    proc = run([python, "-c", probe], check=False, capture=True)
+    if proc.returncode == 0 and "HEADERS_OK" in (proc.stdout or ""):
+        log("    Python {} development headers OK".format(version))
+        return
+
+    out = (proc.stdout or "").strip()
+    log("    Python {} development headers NOT usable".format(version))
+    for line in out.splitlines()[-8:]:
+        if line.strip():
+            log("      " + line)
+    raise BuildError(
+        "Python {} C development headers are missing or incomplete (cannot "
+        "compile '#include <Python.h>').\n{}".format(version, _python_dev_hint(version))
+    )
+
+
+def ensure_depot_tools(cfg):
+    """Clone depot_tools when it is missing, asking the user first.
+
+    depot_tools is required for every V8 build (fetch / gclient / gn / ninja).
+    Rather than failing outright when it is absent, offer to download it so a
+    fresh checkout can be bootstrapped interactively. A non-interactive session
+    (no TTY / EOF) is treated as a "no" and falls back to the usual error.
+    """
+    if os.path.exists(cfg.depot_home):
+        return
+
+    log("    depot_tools not found at {}".format(cfg.depot_home))
+    answer = ""
+    try:
+        answer = input(
+            "    depot_tools is required to build V8. Download it now? [y/N] "
+        ).strip().lower()
+    except (EOFError, OSError):
+        answer = ""
+
+    if answer not in ("y", "yes"):
+        raise BuildError(
+            "depot_tools not found at {}. Install it from "
+            "https://chromium.googlesource.com/chromium/tools/depot_tools.git "
+            "or set DEPOT_HOME.".format(cfg.depot_home)
+        )
+
+    log("    cloning depot_tools into {}".format(cfg.depot_home))
+    os.makedirs(os.path.dirname(cfg.depot_home), exist_ok=True)
+    run(
+        [
+            "git",
+            "clone",
+            "https://chromium.googlesource.com/chromium/tools/depot_tools.git",
+            cfg.depot_home,
+        ]
+    )
+
+
+def ensure_boost(cfg):
+    """Clone the Boost source tree when it is missing, asking the user first.
+
+    The build invokes Boost's bootstrap + b2 locally, so a full Boost source
+    tree (with submodules) is required. Rather than failing outright when it is
+    absent, offer to download it so a fresh checkout can be bootstrapped
+    interactively. A non-interactive session (no TTY / EOF) is treated as a
+    "no" and falls back to the usual error.
+    """
+    if os.path.exists(cfg.boost_root):
+        return
+
+    log("    Boost root not found at {}".format(cfg.boost_root))
+    answer = ""
+    try:
+        answer = input(
+            "    Boost is required to build STPyV8. Download it now? [y/N] "
+        ).strip().lower()
+    except (EOFError, OSError):
+        answer = ""
+
+    if answer not in ("y", "yes"):
+        raise BuildError(
+            "Boost root not found at {}. Provide a Boost source tree via "
+            "--boost-root or BOOST_ROOT.".format(cfg.boost_root)
+        )
+
+    log("    cloning Boost into {}".format(cfg.boost_root))
+    os.makedirs(os.path.dirname(cfg.boost_root), exist_ok=True)
+
+    clone_cmd = [
+        "git",
+        "clone",
+        "--recursive",
+        "--depth",
+        "1",
+        "--shallow-submodules",
+        "https://github.com/boostorg/boost.git",
+        cfg.boost_root,
+    ]
+    # Pin to a specific Boost release when one is configured. Passing --branch
+    # to clone checks the tag out directly (and --recursive initialises the
+    # matching submodules), which is exactly "clone, then checkout <tag> and
+    # re-init submodules" but in a single network-efficient step.
+    boost_tag = getattr(cfg.settings, "BOOST_GIT_TAG", None)
+    if boost_tag:
+        clone_cmd[2:2] = ["--branch", boost_tag]
+        log("    pinning Boost to tag {}".format(boost_tag))
+    run(clone_cmd)
+
+
 def step_preflight(cfg):
     section("1/9 preflight")
 
-    for path, what in ((cfg.depot_home, "depot_tools"), (cfg.boost_root, "Boost root")):
-        if not os.path.exists(path):
-            raise BuildError("{} not found at {}".format(what, path))
-
+    # Fail fast on the cheapest, most common blocker: the CPython development
+    # headers for every requested interpreter. Check this first so that, when a
+    # header library is missing, we print the install hint and exit before
+    # spending any time cloning depot_tools / Boost / V8.
     for python in cfg.pythons:
         if not os.path.isfile(python):
-            raise BuildError("Python interpreter not found at {}".format(python))
+            raise BuildError(
+                "Python interpreter not found at {}. Fix the --python path, or "
+                "install the intended CPython together with its dev headers "
+                "(pythonX.Y-dev / libpythonX.Y-dev).".format(python)
+            )
+    for python in cfg.pythons:
+        log("    Python {}: {}".format(cfg.python_version(python), python))
+        ensure_python_dev(cfg, python)
+
+    ensure_depot_tools(cfg)
+    ensure_boost(cfg)
 
     if IS_WINDOWS:
         if not os.path.isdir(os.path.join(cfg.vs_install, "VC", "Tools", "MSVC")):
@@ -396,31 +600,61 @@ def step_preflight(cfg):
     elif IS_LINUX:
         for tool in ("git", "patch"):
             if shutil.which(tool) is None:
-                raise BuildError("required tool '{}' not found on PATH".format(tool))
+                raise BuildError(
+                    "required tool '{}' not found on PATH.\n{}".format(
+                        tool, _system_tool_hint(tool)
+                    )
+                )
 
     for python in cfg.pythons:
-        log("    Python {}: {}".format(cfg.python_version(python), python))
         ensure_python_deps(python)
     log("    toolchain OK")
+
+
+def ensure_v8(cfg):
+    """Fetch the V8 source tree via depot_tools when it is missing.
+
+    V8 is fetched with depot_tools' ``fetch`` command (which sets up the gclient
+    solution). When no checkout exists we ask the user whether to download it;
+    passing --fetch-v8 skips the prompt and proceeds automatically, which is
+    useful for non-interactive runs.
+    """
+    if os.path.isdir(os.path.join(cfg.v8_home, ".git")):
+        return
+
+    log("    V8 checkout not found at {}".format(cfg.v8_home))
+    if cfg.fetch_v8:
+        answer = "y"
+    else:
+        answer = ""
+        try:
+            answer = input(
+                "    V8 source is required to build STPyV8. Download it now? [y/N] "
+            ).strip().lower()
+        except (EOFError, OSError):
+            answer = ""
+
+    if answer not in ("y", "yes"):
+        raise BuildError(
+            "No V8 checkout at {}. Create one first with:\n"
+            "  {}/fetch --no-history v8\n"
+            "or re-run this script with --fetch-v8.".format(
+                cfg.v8_home, cfg.depot_home
+            )
+        )
+
+    os.makedirs(cfg.v8_src_root, exist_ok=True)
+    run(
+        [depot_tool(cfg, "fetch"), "--no-history", "v8"],
+        cwd=cfg.v8_src_root,
+        env=cfg.env(),
+    )
 
 
 def step_checkout(cfg):
     section("2/9 checkout V8")
 
-    if not os.path.isdir(os.path.join(cfg.v8_home, ".git")):
-        if not cfg.fetch_v8:
-            raise BuildError(
-                "No V8 checkout at {}. Create one first with:\n"
-                "  {}/fetch --no-history v8\n"
-                "or re-run this script with --fetch-v8.".format(
-                    cfg.v8_home, cfg.depot_home
-                )
-            )
-        run(
-            [depot_tool(cfg, "fetch"), "--no-history", "v8"],
-            cwd=cfg.v8_src_root,
-            env=cfg.env(),
-        )
+    ensure_v8(cfg)
 
     tag = cfg.settings.V8_GIT_TAG_STABLE
     log("    settings.py pins V8 {}".format(tag))
@@ -446,11 +680,18 @@ def step_sync(cfg):
             log("    discarding uncommitted changes in v8/build")
             run(["git", "-C", build_repo, "checkout", "--", "."])
 
-    run(
-        [depot_tool(cfg, "gclient"), "sync", "-D", "-j{}".format(cfg.jobs)],
-        cwd=cfg.v8_src_root,
-        env=cfg.env(),
-    )
+    # The sysroot tarball contains file names with literal backslashes
+    # (e.g. system-systemd\x2dcryptsetup.slice) that cannot be created on
+    # NTFS/exFAT mounts, so gclient sync dies with EINVAL. With --no-sysroot we
+    # skip all hooks (which include the sysroot extraction) and regenerate the
+    # build-essential ones by hand afterwards.
+    sync_cmd = [depot_tool(cfg, "gclient"), "sync", "-D", "-j{}".format(cfg.jobs)]
+    if cfg.no_sysroot:
+        sync_cmd.append("--nohooks")
+    run(sync_cmd, cwd=cfg.v8_src_root, env=cfg.env())
+
+    if cfg.no_sysroot:
+        _run_v8_lastchange_hooks(cfg)
 
     if IS_LINUX and cfg.run_build_deps:
         log("    installing additional Linux dependencies (needs sudo)")
@@ -458,6 +699,28 @@ def step_sync(cfg):
             ["./v8/build/install-build-deps.sh"],
             cwd=cfg.v8_src_root,
             env=cfg.env(),
+        )
+
+
+def _run_v8_lastchange_hooks(cfg):
+    """Generate the V8 version headers that 'gclient sync --nohooks' skips.
+
+    gclient's hooks normally produce build/util/LASTCHANGE (and .committime);
+    when we pass --nohooks to dodge the NTFS-incompatible sysroot extraction we
+    must create these ourselves, or the V8 build cannot derive its version and
+    fails. Missing scripts are tolerated (warning only) so unrelated setups
+    still proceed.
+    """
+    lastchange = os.path.join(cfg.v8_home, "build", "util", "lastchange.py")
+    if not os.path.isfile(lastchange):
+        log("    warning: {} not found; skipping version header generation".format(lastchange))
+        return
+    for output_file in ("build/util/LASTCHANGE", "build/util/LASTCHANGE.committime"):
+        run(
+            [cfg.python, lastchange, "-o", output_file],
+            cwd=cfg.v8_home,
+            env=cfg.env(),
+            check=False,
         )
 
 
@@ -525,14 +788,49 @@ def step_toolchain(cfg):
     log("    SDK workarounds applied")
 
 
+def _clean_boost_build_outputs(cfg):
+    """Drop Boost's build cache and staged libs so b2 rebuilds them here.
+
+    Only called after detecting that the checked-in b2 -- and therefore the
+    existing ``bin.v2`` objects and ``stage`` libs -- were produced by a
+    different toolchain and cannot run/link in this environment. Container-built
+    (older-glibc) artifacts are forward-compatible with newer hosts, so replacing
+    them is safe; only build outputs are removed, never the Boost sources.
+    """
+    for name in ("bin.v2", "bin", "stage"):
+        path = os.path.join(cfg.boost_root, name)
+        if os.path.isdir(path):
+            log("    removing stale {} (built by another toolchain)".format(path))
+            shutil.rmtree(path, ignore_errors=True)
+
+
 def _bootstrap_boost(cfg):
     runner = "b2.exe" if IS_WINDOWS else "b2"
-    if os.path.isfile(os.path.join(cfg.boost_root, runner)):
-        return
+    b2_path = os.path.join(cfg.boost_root, runner)
+    stale = False
+    if os.path.isfile(b2_path):
+        # A b2 left over from a different toolchain (e.g. the host's newer
+        # glibc / libstdc++) cannot run here -- it dies with "GLIBC_2.3x not
+        # found" / "GLIBCXX_3.4.x not found". Probe it; if it does not run,
+        # rebuild it with the current toolchain instead of failing much later.
+        probe = run([b2_path, "--version"], cwd=cfg.boost_root, check=False, capture=True)
+        if probe.returncode == 0:
+            return
+        log("    existing {} does not run in this environment; rebuilding b2".format(runner))
+        try:
+            os.remove(b2_path)
+        except OSError:
+            pass
+        stale = True
 
     script = "bootstrap.bat" if IS_WINDOWS else "./bootstrap.sh"
     log("    bootstrapping Boost ({})".format(script))
     run([script], cwd=cfg.boost_root, env=cfg.env())
+
+    if stale:
+        # The object cache and staged libs were built by that other toolchain
+        # too; drop them so the upcoming b2 run rebuilds everything here.
+        _clean_boost_build_outputs(cfg)
 
 
 def _jam_path(path):
@@ -621,6 +919,12 @@ def step_boost(cfg):
     ]
     if IS_WINDOWS:
         common.append("address-model=64")
+    else:
+        # On POSIX the static Boost libraries are linked into the shared
+        # _STPyV8 extension, so they must be built as position-independent code.
+        # Without -fPIC the final link fails with "recompile with -fPIC".
+        common.append("cflags=-fPIC")
+        common.append("cxxflags=-fPIC")
 
     # Build one Boost.Python per interpreter. Each iteration rewrites
     # project-config.jam to declare only that interpreter, so a plain
@@ -692,15 +996,56 @@ def step_icu(cfg):
     log("    installed {}".format(dst))
 
 
+def clean_extension_outputs(cfg):
+    """Remove the in-place extension .so files and the distutils build/ dir.
+
+    These are the extension's own build outputs and the ones most likely to be
+    stale/foreign -- e.g. a .so left by a host build against a newer glibc, which
+    then fails to import here ("undefined symbol: __libc_single_threaded", a
+    glibc 2.32+ symbol). Removing them forces build_ext to recompile from source
+    with the current toolchain. Sources and the V8/Boost trees are untouched.
+    """
+    section("clean extension outputs")
+    removed = False
+    for so in glob.glob(os.path.join(REPO_ROOT, "_STPyV8*.so")):
+        try:
+            os.remove(so)
+            log("    removed {}".format(os.path.basename(so)))
+            removed = True
+        except OSError as error:
+            log("    warning: could not remove {}: {}".format(so, error))
+    build_dir = os.path.join(REPO_ROOT, "build")
+    if os.path.isdir(build_dir):
+        shutil.rmtree(build_dir, ignore_errors=True)
+        log("    removed build/")
+        removed = True
+    if not removed:
+        log("    nothing to clean")
+
+
 def step_extension(cfg, python):
     version = cfg.python_version(python)
     section("8/9 build STPyV8 extension (Python {})".format(version))
 
     cmd = [python, "setup.py", "build_ext", "--inplace"]
-    if cfg.debug:
-        # Force a relink so the /DEBUG PDB link flags actually take effect;
-        # distutils would otherwise skip compiling/linking when sources are
-        # unchanged (a plain rebuild after a non-debug one produces no PDB).
+    # distutils only tracks the object files it compiles; it will NOT relink the
+    # extension when an external static library (v8_monolith) is rebuilt. That
+    # leaves a stale .so linked against the previous V8 (e.g. an old libc++ V8
+    # after switching to libstdc++, or a V8 rebuilt with different flags). Force
+    # a rebuild whenever v8_monolith is newer than the extension so the relink
+    # always picks up the current V8.
+    ext_path = cfg.extension_path(python)
+    force = cfg.debug
+    if (
+        not force
+        and os.path.isfile(cfg.v8_monolith)
+        and ext_path
+        and os.path.isfile(ext_path)
+        and os.path.getmtime(cfg.v8_monolith) > os.path.getmtime(ext_path)
+    ):
+        log("    v8_monolith is newer than the extension; forcing a relink")
+        force = True
+    if force:
         cmd.append("--force")
     run(cmd, cwd=REPO_ROOT, env=cfg.env(python))
 
@@ -770,6 +1115,11 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Cross-platform build driver for STPyV8.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        # Disable prefix abbreviation: an abbreviated flag (e.g. --host for
+        # --hosts) is accepted by argparse but would NOT be recognised by the
+        # docker arg-forwarder (which matches raw tokens), so it would leak into
+        # the container. Requiring exact flags keeps the two in sync.
+        allow_abbrev=False,
     )
 
     parser.add_argument(
@@ -782,13 +1132,13 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--v8-home",
-        default=os.environ.get("V8_HOME") or os.path.join(REPO_ROOT, "v8"),
+        default=os.environ.get("V8_HOME") or os.path.join(REPO_ROOT, ".build", "v8"),
         help="V8 checkout",
     )
     parser.add_argument("--v8-src-root", help="directory gclient sync runs in (default: parent of --v8-home)")
     parser.add_argument(
         "--depot-home",
-        default=os.environ.get("DEPOT_HOME") or os.path.join(REPO_ROOT, "depot_tools"),
+        default=os.environ.get("DEPOT_HOME") or os.path.join(REPO_ROOT, ".build", "depot_tools"),
         help="depot_tools checkout",
     )
     parser.add_argument(
@@ -803,6 +1153,13 @@ def parse_args(argv=None):
     parser.add_argument("--debug", action="store_true", help="emit an extension PDB (_STPyV8.pdb) for crash symbolization; V8 stays in release mode (STPYV8_PDB)")
     parser.add_argument("--fetch-v8", action="store_true", help="run 'fetch --no-history v8' when no checkout exists")
     parser.add_argument("--run-build-deps", action="store_true", help="[Linux] run V8's install-build-deps.sh (needs sudo)")
+    parser.add_argument(
+        "--no-sysroot",
+        action="store_true",
+        help="[Linux/NTFS] skip the sysroot download/extract (gclient --nohooks) and build with use_sysroot=false; "
+        "needed when the checkout lives on a filesystem that rejects the sysroot's backslash file names "
+        "(e.g. NTFS/exFAT). Requires host build deps (--run-build-deps).",
+    )
 
     parser.add_argument("--skip-v8-sync", action="store_true", help="skip gclient sync")
     parser.add_argument("--skip-v8-build", action="store_true", help="skip gn gen / ninja")
@@ -814,9 +1171,51 @@ def parse_args(argv=None):
         help="also build a wheel (bdist_wheel --skip-build-v8) for each interpreter",
     )
     parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="remove existing extension outputs (_STPyV8*.so and build/) before "
+        "building, forcing a from-scratch extension compile; without it the "
+        "build is incremental (only changed sources / a newer v8_monolith relink)",
+    )
+    parser.add_argument(
         "--version",
         help="override the wheel version (default: the V8 tag from settings.py); "
         "the V8 checkout/build tag is unaffected",
+    )
+
+    parser.add_argument(
+        "--docker",
+        action="store_true",
+        help="[Linux/macOS] run the whole pipeline inside the stpyv8-builder "
+        "container instead of natively. The repo and the symlink-resolved build "
+        "tree (.build) are mounted, so V8/Boost/depot_tools are reused from the "
+        "host and the .so / wheels land back in the repo.",
+    )
+    parser.add_argument(
+        "--docker-image",
+        default=DOCKER_IMAGE,
+        help="[--docker] image name to build and run",
+    )
+    parser.add_argument(
+        "--docker-no-build",
+        action="store_true",
+        help="[--docker] fail instead of auto-building the image when it is missing",
+    )
+    parser.add_argument(
+        "--docker-shell",
+        action="store_true",
+        help="[--docker] drop into a bash shell in the container (same mounts) "
+        "instead of building; handy to inspect the mount layout",
+    )
+    parser.add_argument(
+        "--hosts",
+        "--host",
+        dest="hosts",
+        action="append",
+        metavar="HOST:IP",
+        help="[--docker] add an entry to the container's /etc/hosts (docker "
+        "--add-host); repeatable, e.g. --hosts my.mirror:10.0.0.1. Accepts "
+        "either 'host:ip' or the /etc/hosts order 'ip host'.",
     )
 
     return parser.parse_args(argv)
@@ -843,8 +1242,250 @@ def load_settings(cfg, debug):
     return settings
 
 
+# ---------------------------------------------------------------------------
+# Docker backend (Linux/macOS): run the pipeline inside stpyv8-builder
+# ---------------------------------------------------------------------------
+def _docker_present():
+    return shutil.which("docker") is not None
+
+
+def _docker_image_exists(image):
+    """True when *image* is already built (quiet; no streamed '$ ...' line)."""
+    try:
+        subprocess.run(
+            ["docker", "image", "inspect", image],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def _docker_build_image(image):
+    if not os.path.isfile(os.path.join(DOCKER_DIR, "Dockerfile")):
+        raise BuildError("docker/Dockerfile not found under {}".format(DOCKER_DIR))
+    log("    building image '{}' from {}".format(image, DOCKER_DIR))
+    run(["docker", "build", "-t", image, DOCKER_DIR])
+
+
+def _forward_without_docker_flags(argv):
+    """Drop the docker-only and host-path flags; keep the rest for the container.
+
+    ``--python`` is translated into ``UV_PYTHONS`` (the container selects its own
+    interpreters), and the three build-tree flags are re-emitted with their
+    container paths, so their host values must not be forwarded verbatim.
+    """
+    value_flags = (
+        "--python",
+        "--docker-image",
+        "--v8-home",
+        "--v8-src-root",
+        "--depot-home",
+        "--boost-root",
+        "--hosts",
+        "--host",
+    )
+    bool_flags = ("--docker", "--docker-no-build", "--docker-shell")
+    kept = []
+    skip_next = False
+    for token in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        name = token.split("=", 1)[0]
+        if token in value_flags:  # "--flag value": drop the value token too
+            skip_next = True
+            continue
+        if token in bool_flags or name in value_flags:  # bool flag, or "--flag=value"
+            continue
+        kept.append(token)
+    return kept
+
+
+def _normalize_add_host(value):
+    """Normalise a --hosts value into docker's ``host:ip`` --add-host form.
+
+    Accepts the three shapes people naturally type and always returns
+    ``host:ip`` (docker's required order):
+      * ``host:ip``    -> ``host:ip`` (pass-through, incl. ``host:ip:alias``)
+      * ``ip host``    -> ``host:ip`` (the /etc/hosts column order)
+      * ``ip:host``    -> ``host:ip``
+    """
+    token = (value or "").strip()
+    if not token:
+        raise BuildError("--hosts needs a value, e.g. --hosts my.mirror:10.0.0.1")
+    # Space-separated: /etc/hosts order ("ip host").
+    parts = token.split()
+    if len(parts) == 2:
+        first, second = parts
+        return "{}:{}".format(second, first) if _looks_like_ip(first) else token
+    if len(parts) > 2:
+        raise BuildError(
+            "cannot parse --hosts value {!r}; expected 'host:ip' or 'ip host'".format(value)
+        )
+    # Single token: figure out which side of ':' is the IP.
+    head, sep, tail = token.partition(":")
+    if not sep:
+        raise BuildError(
+            "cannot parse --hosts value {!r}; expected 'host:ip' or 'ip host'".format(value)
+        )
+    if _looks_like_ip(head):
+        # "ip:host" (or "ip:host:alias") -> move the IP to the end.
+        rest = tail.split(":")
+        return ":".join([rest[0], head] + rest[1:])
+    return token  # already host:ip (possibly host:ip:alias)
+
+
+def _looks_like_ip(text):
+    """True when *text* is a dotted-quad IPv4 address."""
+    octets = text.split(".")
+    if len(octets) != 4:
+        return False
+    for octet in octets:
+        if not octet.isdigit() or not 0 <= int(octet) <= 255:
+            return False
+    return True
+
+
+def run_in_docker(args, argv):
+    section("docker backend")
+    if IS_WINDOWS:
+        raise BuildError(
+            "--docker is wired up for Linux/macOS hosts only (Docker Desktop path "
+            "translation is not handled); run it from WSL or a Linux/macOS shell."
+        )
+    if not _docker_present():
+        raise BuildError("'docker' not found on PATH; install Docker to use --docker.")
+
+    image = args.docker_image or DOCKER_IMAGE
+
+    # Resolve the three build trees to their REAL host paths. This is the crux of
+    # the ".build is a symlink" problem: os.path.realpath follows
+    # .build -> ~/.stpyv8-build, so we mount the directory it points at. Mounting
+    # the symlink itself (or the un-resolved .build/v8) would leave a dangling
+    # path inside the container, which has no ~/.stpyv8-build of its own.
+    v8_home = _resolve_v8_home(args.v8_home)
+    depot_home = os.path.abspath(args.depot_home)
+    boost_root = os.path.abspath(args.boost_root)
+    reals = [os.path.realpath(p) for p in (v8_home, depot_home, boost_root)]
+    try:
+        build_root = os.path.commonpath(reals)
+    except ValueError:
+        raise BuildError(
+            "V8 / depot_tools / Boost do not share a common directory ({}); "
+            "--docker mounts a single build root, so keep them under one tree "
+            "(the default .build layout).".format(reals)
+        )
+    if not os.path.isdir(build_root):
+        log("    note: build root {} does not exist yet; docker will create it".format(build_root))
+
+    def container_path(host_path):
+        rel = os.path.relpath(os.path.realpath(host_path), build_root)
+        return os.path.join(CONTAINER_BUILD_ROOT, rel)
+
+    c_v8 = container_path(v8_home)
+    c_depot = container_path(depot_home)
+    c_boost = container_path(boost_root)
+
+    # Always (re)build unless explicitly disabled. `docker build` is a near
+    # no-op when nothing changed (every layer hits the cache), so this keeps the
+    # image in sync with docker/Dockerfile + entrypoint.sh without the user
+    # having to remember to rebuild by hand after editing them.
+    if args.docker_no_build:
+        if not _docker_image_exists(image):
+            raise BuildError(
+                "image '{}' is missing and --docker-no-build was given; build it "
+                "first with: docker build -t {} {}".format(image, image, DOCKER_DIR)
+            )
+    else:
+        _docker_build_image(image)
+
+    # Turn explicitly requested host interpreters into the versions the
+    # container's uv-managed Pythons provide. With no --python we leave UV_PYTHONS
+    # unset so the image default (all supported versions) applies.
+    env_args = []
+    if args.pythons:
+        versions = []
+        for python in args.pythons:
+            version = output(
+                [python, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"]
+            )
+            if not version:
+                raise BuildError(
+                    "cannot determine the version of host interpreter {}".format(python)
+                )
+            versions.append(version)
+        env_args = ["-e", "UV_PYTHONS=" + " ".join(dict.fromkeys(versions))]
+
+    if args.docker_shell:
+        # Same mounts, but start an interactive shell instead of the build.
+        run_cmd = ["--entrypoint", "bash"]
+    else:
+        run_cmd = _forward_without_docker_flags(argv)
+        run_cmd += ["--v8-home", c_v8, "--depot-home", c_depot, "--boost-root", c_boost]
+
+    cmd = ["docker", "run", "--rm"]
+    # Keep the session interactive when attached to a TTY so depot_tools / gclient
+    # and the entrypoint can prompt; stay quiet (no -t) under CI / pipes.
+    if sys.stdin.isatty():
+        cmd.append("-it")
+    # Run as the invoking host user: the bind-mounted repo and build tree are
+    # owned by that user, so (a) git never trips its "dubious ownership" guard on
+    # the host-owned V8 / DEPS repos, and (b) artifacts written back stay owned
+    # by the user (no root-owned files to clean up later). HOME points at a
+    # writable tmpfs because the container has no passwd entry for this uid.
+    try:
+        cmd += ["--user", "{}:{}".format(os.getuid(), os.getgid()), "-e", "HOME=/tmp"]
+    except AttributeError:
+        pass  # os.getuid unavailable; fall back to running as root
+    cmd += [
+        "-v", "{}:{}".format(os.path.abspath(REPO_ROOT), CONTAINER_REPO),
+        "-v", "{}:{}".format(build_root, CONTAINER_BUILD_ROOT),
+    ]
+    # Extra /etc/hosts entries inside the container (docker --add-host). The
+    # value is normalised to docker's "host:ip" order so /etc/hosts-style
+    # "ip host" input works too.
+    for host in (args.hosts or []):
+        cmd += ["--add-host", _normalize_add_host(host)]
+    cmd += env_args
+    cmd += [image]
+    cmd += run_cmd
+
+    log("    repo    : {} -> {}".format(os.path.abspath(REPO_ROOT), CONTAINER_REPO))
+    log("    build   : {} -> {} (resolved through the .build symlink)".format(
+        build_root, CONTAINER_BUILD_ROOT))
+    log("    v8      : {}".format(c_v8))
+    log("    depot   : {}".format(c_depot))
+    log("    boost   : {}".format(c_boost))
+    if env_args:
+        log("    pythons : {}".format(env_args[-1].split("=", 1)[1]))
+    log("    $ " + " ".join(cmd))
+
+    # check=False so a failing build surfaces through its streamed output and a
+    # clean exit status, not a Python traceback.
+    proc = run(cmd, check=False)
+    log("")
+    if proc.returncode == 0:
+        log("container finished; artifacts are in the repo (.so / dist/) and the build tree")
+    else:
+        log("docker run exited with status {}".format(proc.returncode))
+    return proc.returncode
+
+
 def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
     args = parse_args(argv)
+
+    if args.docker or args.docker_shell:
+        return run_in_docker(args, argv)
+
+    if args.hosts:
+        log("note: --hosts only affects --docker runs (container /etc/hosts); "
+            "ignored for a native build")
+
     cfg = Config(args)
 
     section("STPyV8 build")
@@ -856,6 +1497,9 @@ def main(argv=None):
         log("  version  : {}".format(args.version))
 
     cfg.settings = load_settings(cfg, args.debug)
+
+    if cfg.clean:
+        clean_extension_outputs(cfg)
 
     try:
         step_preflight(cfg)

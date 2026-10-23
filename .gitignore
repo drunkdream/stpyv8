@@ -13,3 +13,7 @@ switch_repo*
 *.pdb
 *.cmake
 .idea
+
+# STPyV8 local build tree and compiled extensions
+.build
+*.so
