@@ -1109,6 +1109,232 @@ void CPythonObject::Caller(const v8::FunctionCallbackInfo<v8::Value>& info)
     END_HANDLE_EXCEPTION_NO_INTERCEPT(v8::Undefined(info.GetIsolate()))
 }
 
+// Call handler for a prototype method created by PopulatePrototypeMethods. The
+// method name is captured (owned-forever External, same pattern as the External
+// <cls> handed to Caller); `self` is bound from the JS receiver at call time, so
+// `Class.prototype.method.apply(instance, args)` runs the Python method against
+// that instance -- exactly what the instance interceptor does for `instance.method`.
+void CPythonObject::PrototypeMethod(const v8::FunctionCallbackInfo<v8::Value>& info)
+{
+    v8::HandleScope handle_scope(info.GetIsolate());
+
+    TRY_HANDLE_EXCEPTION_NO_INTERCEPT(v8::Undefined(info.GetIsolate()));
+
+    CPythonGIL python_gil;
+
+    if (info.Data().IsEmpty() || !info.Data()->IsExternal())
+        CALLBACK_RETURN_NO_INTERCEPT(v8::Undefined(info.GetIsolate()));
+
+    v8::Handle<v8::External> field = v8::Handle<v8::External>::Cast(info.Data());
+    std::string name = *static_cast<std::string *>(field->Value());
+
+    // Only forward when the receiver is a wrapped Python instance. Otherwise (e.g.
+    // the method is invoked on the prototype object itself) Wrap().attr() would
+    // re-enter the prototype interceptor and recurse infinitely.
+    if (!CPythonObject::IsWrapped(info.This()))
+    {
+        info.GetIsolate()->ThrowException(v8::Exception::TypeError(v8::String::NewFromUtf8(
+            info.GetIsolate(), (name + " called on a non-instance receiver").c_str()).ToLocalChecked()));
+        CALLBACK_RETURN_NO_INTERCEPT(v8::Undefined(info.GetIsolate()));
+    }
+
+    // Bind self from the receiver at call time. `.attr()` may raise (e.g. a
+    // non-Python `this`); the surrounding TRY_HANDLE_EXCEPTION turns that into a
+    // JS exception, matching how a missing/wrong method behaves elsewhere.
+    py::object self = CJavascriptObject::Wrap(info.This()).attr(name.c_str());
+
+    py::object result;
+
+    switch (info.Length())
+    {
+        BOOST_PP_FOR((0, 10), GEN_CASE_PRED, GEN_CASE_OP, GEN_CASE_MACRO)
+    default:
+        info.GetIsolate()->ThrowException(v8::Exception::Error(v8::String::NewFromUtf8(info.GetIsolate(), "too many arguments").ToLocalChecked()));
+
+        CALLBACK_RETURN_NO_INTERCEPT(v8::Undefined(info.GetIsolate()));
+    }
+
+    CALLBACK_RETURN_NO_INTERCEPT(Wrap(result));
+
+    END_HANDLE_EXCEPTION_NO_INTERCEPT(v8::Undefined(info.GetIsolate()))
+}
+
+// Prototype-level forwarder (interceptor). Exposes a Python class's instance
+// methods on the JS prototype object so `Class.prototype.method` resolves and can
+// be .apply()d to an instance. Implemented as a named-property INTERCEPTOR (not
+// real own properties) on purpose: instance access keeps flowing through the
+// instance interceptor (HasRealNamedProperty does NOT see interceptor-forwarded
+// names, so HasRealPrototypeProperty stays false and there is no deferral), which
+// avoids the infinite recursion that real own properties would cause.
+v8::Intercepted CPythonObject::PrototypeNamedGetter(v8::Local<v8::Name> prop, const v8::PropertyCallbackInfo<v8::Value>& info)
+{
+    v8::HandleScope handle_scope(info.GetIsolate());
+
+    TRY_HANDLE_EXCEPTION(v8::Undefined(info.GetIsolate()))
+
+    CPythonGIL python_gil;
+
+    v8::Local<v8::Context> ctx = info.GetIsolate()->GetCurrentContext();
+
+    // Step aside for any REAL property anywhere on the prototype chain, INCLUDING
+    // Object.prototype built-ins (hasOwnProperty/toString/valueOf/...): those must
+    // resolve to the real JS property. Intercepting them would recurse, because the
+    // receiver is the prototype object (not a wrapped Python instance) and
+    // Wrap().attr() would re-enter this interceptor.
+    {
+        v8::Local<v8::Object> chain = info.Holder();
+        while (!chain.IsEmpty())
+        {
+            v8::Maybe<bool> has = chain->HasRealNamedProperty(ctx, prop);
+            if (has.IsJust() && has.FromJust())
+                CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Value>());
+            v8::Local<v8::Value> up = chain->GetPrototype();
+            if (!up->IsObject())
+                break;
+            chain = up.As<v8::Object>();
+        }
+    }
+
+    v8::String::Utf8Value name(info.GetIsolate(), v8::Local<v8::String>::Cast(prop));
+    if (*name == nullptr)
+        CALLBACK_RETURN_HANDLED(v8::Undefined(info.GetIsolate()));
+
+    std::string prop_name(*name);
+    if (prop_name == "constructor" || prop_name == "prototype")
+        CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Value>());
+
+    if (info.Data().IsEmpty() || !info.Data()->IsExternal())
+        CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Value>());
+    v8::Handle<v8::External> field = v8::Handle<v8::External>::Cast(info.Data());
+    py::object cls = *static_cast<py::object *>(field->Value());
+
+    PyObject *value = ::PyObject_GetAttrString(cls.ptr(), *name);
+    if (!value)
+    {
+        if (PyErr_Occurred())
+            ::PyErr_Clear();
+        CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Value>());
+    }
+    py::object attr = py::object(py::handle<>(value));
+
+    // A regular instance method -> return a self-binding function so that
+    // Class.prototype.method.apply(instance, args) runs the Python method against
+    // that instance (self is bound from the receiver at call time, in
+    // PrototypeMethod). Everything else is wrapped as-is.
+    if (PyFunction_Check(attr.ptr()))
+    {
+        std::string *method_name = new std::string(prop_name); // owned forever (External)
+        v8::Local<v8::FunctionTemplate> fn_tmpl = v8::FunctionTemplate::New(info.GetIsolate());
+        fn_tmpl->SetCallHandler(PrototypeMethod, v8::External::New(info.GetIsolate(), method_name));
+        v8::MaybeLocal<v8::Function> fn = fn_tmpl->GetFunction(ctx);
+        if (fn.IsEmpty())
+            CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Value>());
+        CALLBACK_RETURN_HANDLED(fn.ToLocalChecked());
+    }
+
+    CALLBACK_RETURN_HANDLED(Wrap(attr));
+
+    END_HANDLE_EXCEPTION(v8::Undefined(info.GetIsolate()))
+}
+
+v8::Intercepted CPythonObject::PrototypeNamedQuery(v8::Local<v8::Name> prop, const v8::PropertyCallbackInfo<v8::Integer>& info)
+{
+    v8::HandleScope handle_scope(info.GetIsolate());
+
+    TRY_HANDLE_EXCEPTION(v8::Handle<v8::Integer>())
+
+    CPythonGIL python_gil;
+
+    v8::Local<v8::Context> ctx = info.GetIsolate()->GetCurrentContext();
+
+    // Step aside for any REAL property on the prototype chain (incl. Object.prototype
+    // built-ins), same as the getter.
+    {
+        v8::Local<v8::Object> chain = info.Holder();
+        while (!chain.IsEmpty())
+        {
+            v8::Maybe<bool> has = chain->HasRealNamedProperty(ctx, prop);
+            if (has.IsJust() && has.FromJust())
+                CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Integer>());
+            v8::Local<v8::Value> up = chain->GetPrototype();
+            if (!up->IsObject())
+                break;
+            chain = up.As<v8::Object>();
+        }
+    }
+
+    v8::String::Utf8Value name(info.GetIsolate(), v8::Local<v8::String>::Cast(prop));
+    if (*name == nullptr)
+        CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Integer>());
+
+    std::string prop_name(*name);
+    if (prop_name == "constructor" || prop_name == "prototype")
+        CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Integer>());
+
+    if (info.Data().IsEmpty() || !info.Data()->IsExternal())
+        CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Integer>());
+    v8::Handle<v8::External> field = v8::Handle<v8::External>::Cast(info.Data());
+    py::object cls = *static_cast<py::object *>(field->Value());
+
+    // Report forwarded members as non-enumerable, like real JS prototype methods,
+    // so `"open" in XHR.prototype` is true without polluting Object.keys().
+    if (::PyObject_HasAttrString(cls.ptr(), *name))
+        CALLBACK_RETURN_HANDLED(v8::Integer::New(info.GetIsolate(), v8::DontEnum));
+
+    CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Integer>());
+
+    END_HANDLE_EXCEPTION(v8::Handle<v8::Integer>())
+}
+
+void CPythonObject::PopulatePrototypeMethods(v8::Isolate *isolate, py::object cls, v8::Local<v8::FunctionTemplate> tmpl)
+{
+    CPythonGIL python_gil;
+
+    // Skip templates that did NOT Inherit -- i.e. those with no non-builtins
+    // ancestor, whose base is Python object (JSClass itself, and object). For such
+    // a template V8 defaults the prototype's [[Prototype]] straight to
+    // Object.prototype; calling PrototypeTemplate()+SetHandler then materializes it
+    // as a SEPARATE object, inserting a spurious level into the chain (the `?` in
+    // testClassHierarchy) and hiding Object.prototype from the chain walk. Classes
+    // that DO inherit from a user base (the normal case -- anything deriving from
+    // JSClass) are handled normally below.
+    bool inherited = false;
+    PyObject *mro = ::PyObject_GetAttrString(cls.ptr(), "__mro__");
+    if (mro && PyTuple_Check(mro))
+    {
+        Py_ssize_t count = PyTuple_GET_SIZE(mro);
+        for (Py_ssize_t i = 1; i < count && !inherited; ++i)
+        {
+            PyObject *base = PyTuple_GET_ITEM(mro, i); // borrowed
+            PyObject *mod = ::PyObject_GetAttrString(base, "__module__");
+            bool base_builtins = false;
+            if (mod)
+            {
+                base_builtins = PyUnicode_Check(mod) &&
+                                std::string(PyUnicode_AsUTF8(mod)) == "builtins";
+                Py_DECREF(mod);
+            }
+            else
+            {
+                PyErr_Clear();
+            }
+            if (!base_builtins)
+                inherited = true;
+        }
+    }
+    Py_XDECREF(mro);
+
+    if (!inherited)
+        return;
+
+    // Attach the prototype forwarder. The class is handed to the callbacks via the
+    // handler data (same owned-forever External pattern as the CallHandler).
+    v8::Local<v8::ObjectTemplate> proto = tmpl->PrototypeTemplate();
+    proto->SetHandler(v8::NamedPropertyHandlerConfiguration(
+        PrototypeNamedGetter, nullptr, PrototypeNamedQuery, nullptr, nullptr,
+        v8::External::New(isolate, new py::object(cls))));
+}
+
 void CPythonObject::SetupObjectTemplate(v8::Isolate *isolate, v8::Handle<v8::ObjectTemplate> clazz)
 {
     v8::HandleScope handle_scope(isolate);
@@ -1253,6 +1479,13 @@ v8::Local<v8::FunctionTemplate> CPythonObject::GetClassTemplate(v8::Isolate *iso
         IndexedGetter, IndexedSetter, IndexedQuery, IndexedDeleter, IndexedEnumerator));
     if (instances_callable)
         inst->SetCallAsFunctionHandler(Caller);
+
+    // Expose the class's instance methods on the JS prototype object too (see the
+    // long note in Wrapper.h). Real own properties, only for classes that define
+    // user methods -- so it does not disturb prototype-chain walks, does not
+    // shadow defineProperty'd accessors, and leaves method-less base prototypes
+    // mapping straight onto Object.prototype.
+    PopulatePrototypeMethods(isolate, cls, tmpl);
 
     per_isolate.emplace(
         cls.ptr(),

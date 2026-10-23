@@ -47,6 +47,32 @@ public:
 
     static void Caller(const v8::FunctionCallbackInfo<v8::Value>& info);
 
+    // Expose a Python class's instance methods on the JS prototype object
+    // (Class.prototype.method), so SDK code that grabs a prototype method and
+    // .apply()/.call()/.bind()s it to an instance works.
+    //
+    // V8 only routes *instance* access through the NamedPropertyHandler and never
+    // promotes those names to prototype own properties, so `Class.prototype.method`
+    // is otherwise `undefined` and `Class.prototype.method.apply(instance, args)`
+    // throws "Cannot read properties of undefined (reading 'apply')". This is
+    // unchanged on V8 13: 13 fixed *static*-attribute exposure (own props on the
+    // constructor, see PopulateStaticProperties) but NOT instance-method-on-prototype
+    // -- a different mechanism -- so this is still required.
+    //
+    // Implemented as a named-property INTERCEPTOR on the prototype (not real own
+    // properties): real own properties would make HasRealPrototypeProperty report
+    // true, so the instance interceptor would defer every method access to the
+    // prototype method, which re-does the lookup -> infinite recursion. An
+    // interceptor is invisible to HasRealNamedProperty, so instance access keeps
+    // flowing through the instance interceptor unchanged. The getter/query step
+    // aside for real own properties (defineProperty'd accessors win), and the
+    // handler is never attached to Python's object base (its prototype must map
+    // straight onto Object.prototype).
+    static v8::Intercepted PrototypeNamedGetter(v8::Local<v8::Name> prop, const v8::PropertyCallbackInfo<v8::Value>& info);
+    static v8::Intercepted PrototypeNamedQuery(v8::Local<v8::Name> prop, const v8::PropertyCallbackInfo<v8::Integer>& info);
+    static void PrototypeMethod(const v8::FunctionCallbackInfo<v8::Value>& info);
+    static void PopulatePrototypeMethods(v8::Isolate *isolate, py::object cls, v8::Local<v8::FunctionTemplate> tmpl);
+
 #ifdef SUPPORT_TRACE_LIFECYCLE
     static void DisposeCallback(v8::Persistent<v8::Value> object, void* parameter);
 #endif

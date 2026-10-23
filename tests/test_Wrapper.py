@@ -1494,6 +1494,54 @@ class TestWrapper(unittest.TestCase):
             self.assertEqual("BODY", ctxt.eval("(new Element()).tagName"))
             self.assertEqual("html:node", ctxt.eval("(new Element()).describe()"))
 
+    def testPrototypeMethodForwarding(self):
+        # A Python class's instance methods must also be reachable on the JS
+        # *prototype* object (Class.prototype.method), not only on instances. V8
+        # routes only instance access through the NamedPropertyHandler and never
+        # promotes those names to prototype own properties, so without exposing
+        # them `Class.prototype.method` is `undefined` and SDK code doing
+        # `Class.prototype.method.apply(instance, args)` throws
+        # "Cannot read properties of undefined (reading 'apply')". (Still true on
+        # V8 13: static-attribute exposure was fixed, instance-method-on-prototype
+        # was not -- see PopulatePrototypeMethods in src/Wrapper.cpp.)
+        dom = _make_dom()
+
+        class Global(STPyV8.JSClass):
+            def __init__(self):
+                self.Element = dom["Element"]
+                self.JSNode = dom["JSNode"]
+
+        with STPyV8.JSContext(Global()) as ctxt:
+            # The method is a real own property on the prototype object.
+            self.assertEqual("function", ctxt.eval("typeof Element.prototype.describe"))
+            self.assertEqual("function", ctxt.eval("typeof JSNode.prototype.describe"))
+            self.assertTrue(ctxt.eval("'describe' in Element.prototype"))
+            # The prototype query interceptor reports forwarded methods as present,
+            # so hasOwnProperty('describe') is true -- matching real JS, where a
+            # prototype method is an own property of the prototype object.
+            self.assertTrue(ctxt.eval("Element.prototype.hasOwnProperty('describe')"))
+            # SDK pattern: grab the prototype method and apply/call it to an
+            # instance; `self` is bound from the receiver at call time.
+            self.assertEqual(
+                "html:node",
+                ctxt.eval("Element.prototype.describe.apply(new Element(), [])"),
+            )
+            self.assertEqual(
+                "html:node",
+                ctxt.eval("Element.prototype.describe.call(new Element())"),
+            )
+            # An inherited method is forwarded on the base class's prototype too.
+            self.assertEqual(
+                "node:node",
+                ctxt.eval("JSNode.prototype.describe.apply(new JSNode(), [])"),
+            )
+            # The ordinary instance path is unchanged (no regression).
+            self.assertEqual("html:node", ctxt.eval("(new Element()).describe()"))
+            # constructor is NOT shadowed; a missing name still resolves to
+            # undefined.
+            self.assertTrue(ctxt.eval("Element.prototype.constructor === Element"))
+            self.assertTrue(ctxt.eval("Element.prototype.nope === undefined"))
+
     def testClassHierarchyCallable(self):
         # `typeof` is "function" only for classes that define __call__; a plain
         # object reports "object" and is not callable in JS (standard semantics).
