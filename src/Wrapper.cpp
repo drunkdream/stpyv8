@@ -1176,6 +1176,13 @@ v8::Intercepted CPythonObject::PrototypeNamedGetter(v8::Local<v8::Name> prop, co
 
     v8::Local<v8::Context> ctx = info.GetIsolate()->GetCurrentContext();
 
+    // A Name can be a Symbol (Symbol.iterator, Symbol.toPrimitive, ...) as well as
+    // a string. Casting a symbol to Local<String> and reading it as UTF-8 is
+    // undefined behaviour (and can corrupt the heap -- it crashed under
+    // getOwnPropertyDescriptor walks), so symbols step aside for V8 to resolve.
+    if (!prop->IsString())
+        CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Value>());
+
     // Step aside for any REAL property anywhere on the prototype chain, INCLUDING
     // Object.prototype built-ins (hasOwnProperty/toString/valueOf/...): those must
     // resolve to the real JS property. Intercepting them would recurse, because the
@@ -1217,11 +1224,22 @@ v8::Intercepted CPythonObject::PrototypeNamedGetter(v8::Local<v8::Name> prop, co
     }
     py::object attr = py::object(py::handle<>(value));
 
+    // ONLY regular instance methods are forwarded. Everything else -- notably
+    // @property descriptors, but also constants / nested classes / staticmethods
+    // -- must NOT be wrapped here: Wrap(property) instantiates a JS object for
+    // Python's built-in property type (GetClassTemplate on property), which
+    // re-enters this machinery from inside a V8 property lookup and corrupts the
+    // heap; and a wrapped constant would pose as a data property on the
+    // prototype. Let V8 resolve those normally (undefined on the prototype, as
+    // before this forwarder existed); @property access is answered on the
+    // instance path (fget/fset, see the SUPPORT_PROPERTY branches).
+    if (!PyFunction_Check(attr.ptr()))
+        CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Value>());
+
     // A regular instance method -> return a self-binding function so that
     // Class.prototype.method.apply(instance, args) runs the Python method against
     // that instance (self is bound from the receiver at call time, in
-    // PrototypeMethod). Everything else is wrapped as-is.
-    if (PyFunction_Check(attr.ptr()))
+    // PrototypeMethod).
     {
         std::string *method_name = new std::string(prop_name); // owned forever (External)
         v8::Local<v8::FunctionTemplate> fn_tmpl = v8::FunctionTemplate::New(info.GetIsolate());
@@ -1231,8 +1249,6 @@ v8::Intercepted CPythonObject::PrototypeNamedGetter(v8::Local<v8::Name> prop, co
             CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Value>());
         CALLBACK_RETURN_HANDLED(fn.ToLocalChecked());
     }
-
-    CALLBACK_RETURN_HANDLED(Wrap(attr));
 
     END_HANDLE_EXCEPTION(v8::Undefined(info.GetIsolate()))
 }
@@ -1246,6 +1262,13 @@ v8::Intercepted CPythonObject::PrototypeNamedQuery(v8::Local<v8::Name> prop, con
     CPythonGIL python_gil;
 
     v8::Local<v8::Context> ctx = info.GetIsolate()->GetCurrentContext();
+
+    // A Name can be a Symbol (Symbol.iterator, Symbol.toPrimitive, ...) as well as
+    // a string. Casting a symbol to Local<String> and reading it as UTF-8 is
+    // undefined behaviour (and can corrupt the heap -- it crashed under
+    // getOwnPropertyDescriptor walks), so symbols step aside for V8 to resolve.
+    if (!prop->IsString())
+        CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Integer>());
 
     // Step aside for any REAL property on the prototype chain (incl. Object.prototype
     // built-ins), same as the getter.
@@ -1276,10 +1299,25 @@ v8::Intercepted CPythonObject::PrototypeNamedQuery(v8::Local<v8::Name> prop, con
     v8::Handle<v8::External> field = v8::Handle<v8::External>::Cast(info.Data());
     py::object cls = *static_cast<py::object *>(field->Value());
 
-    // Report forwarded members as non-enumerable, like real JS prototype methods,
-    // so `"open" in XHR.prototype` is true without polluting Object.keys().
-    if (::PyObject_HasAttrString(cls.ptr(), *name))
-        CALLBACK_RETURN_HANDLED(v8::Integer::New(info.GetIsolate(), v8::DontEnum));
+    // Answer ONLY for regular instance methods -- the same set the getter
+    // forwards (see the note there). Answering for anything else (e.g. a
+    // @property) would make V8 synthesise a data descriptor and then call the
+    // getter, which no longer handles those names. Non-enumerable, like real JS
+    // prototype methods, so `"open" in XHR.prototype` is true without polluting
+    // Object.keys().
+    {
+        PyObject *value = ::PyObject_GetAttrString(cls.ptr(), *name);
+        if (!value)
+        {
+            if (PyErr_Occurred())
+                ::PyErr_Clear();
+            CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Integer>());
+        }
+        bool is_method = PyFunction_Check(value);
+        Py_DECREF(value);
+        if (is_method)
+            CALLBACK_RETURN_HANDLED(v8::Integer::New(info.GetIsolate(), v8::DontEnum));
+    }
 
     CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Integer>());
 
