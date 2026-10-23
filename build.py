@@ -1378,6 +1378,17 @@ def run_in_docker(args, argv):
             "--docker mounts a single build root, so keep them under one tree "
             "(the default .build layout).".format(reals)
         )
+    # On POSIX, scattered absolute paths still share the filesystem root, so
+    # commonpath returns "/" instead of raising. Mounting "/" would expose the
+    # whole host inside the container -- reject it and ask for a dedicated dir.
+    if build_root == os.path.sep:
+        raise BuildError(
+            "V8 / depot_tools / Boost do not share a dedicated common directory "
+            "(their only common ancestor is the filesystem root '{sep}'). "
+            "--docker mounts a single build root, so keep the three trees under "
+            "one directory -- the default .build layout, or e.g. /opt/stpyv8 "
+            "with v8, depot_tools and boost inside it.".format(sep=os.path.sep)
+        )
     if not os.path.isdir(build_root):
         log("    note: build root {} does not exist yet; docker will create it".format(build_root))
 
