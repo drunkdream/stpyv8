@@ -36,6 +36,8 @@ __all__ = [
     "JSUnlocker",
     "JSPlatform",
     "install_property_accessors",
+    "install_class_attributes",
+    "auto_prototype_members",
     "auto_property_accessors",
 ]
 
@@ -405,8 +407,8 @@ class JSContext(_STPyV8.JSContext):
     def __enter__(self):
         self.enter()
 
-        if auto_property_accessors:
-            _auto_install_property_accessors(self, getattr(self, "_global_object", None))
+        if auto_prototype_members or auto_property_accessors:
+            _auto_install_prototype_members(self, getattr(self, "_global_object", None))
 
         return self
 
@@ -460,6 +462,29 @@ _PROPERTY_ACCESSOR_PRELUDE = """
 });
 """
 
+# Installed by install_class_attributes: mirror a class's constants onto the
+# prototype as read-only, non-enumerable data properties, so they are readable
+# through the prototype chain (like Node.prototype.ELEMENT_NODE) without showing
+# up in Object.keys() / for..in. Read-only on purpose: they are constants, and a
+# writable one would let `instance.CONST = x` land on the Python object while
+# reads still resolved to the prototype value -- an inconsistency no real engine
+# has.
+_CLASS_ATTRIBUTE_PRELUDE = """
+(function (ctor, specsJson) {
+    var specs = JSON.parse(specsJson);
+    var proto = ctor.prototype;
+
+    for (var i = 0; i < specs.length; i++) {
+        Object.defineProperty(proto, specs[i][0], {
+            configurable: true,
+            enumerable: false,
+            writable: false,
+            value: specs[i][1]
+        });
+    }
+});
+"""
+
 
 def _prototype_property_get(obj, name):
     # A JS-object receiver (Cls.prototype itself, or
@@ -483,6 +508,67 @@ def _prototype_property_set(obj, name, value):
         )
 
     setattr(obj, name, value)
+
+
+# Value types mirrored onto the prototype by install_class_attributes. Anything
+# else (functions, descriptors, nested classes, mutable containers, instances)
+# is deliberately left off: it either belongs on the constructor or is not a
+# constant in the first place.
+_CONSTANT_TYPES = (bool, int, float, str, type(None))
+
+
+def _collect_attribute_specs(cls, names):
+    """Return ``[[name, value], ...]`` for *cls*'s class-level constants.
+
+    With *names* omitted every constant along the MRO is collected (most-derived
+    definition wins, each name once), skipping dunders and the names the class
+    hid from JS via ``__js_hidden__``.
+    """
+    hidden = set()
+
+    for base in getattr(cls, "__mro__", (cls,)):
+        hidden.update(getattr(base, "__js_hidden__", ()) or ())
+
+    if names is None:
+        names = []
+        seen = set()
+
+        for base in getattr(cls, "__mro__", (cls,)):
+            for name, value in vars(base).items():
+                if name.startswith("__") or name in hidden or name in seen:
+                    continue
+
+                if not isinstance(value, _CONSTANT_TYPES):
+                    continue
+
+                seen.add(name)
+                names.append(name)
+
+    specs = []
+
+    for name in names:
+        if name in hidden:
+            continue
+
+        if not hasattr(cls, name):
+            raise ValueError(
+                "'%s' is not an attribute of {} at all".format(
+                    name, getattr(cls, "__name__", cls)
+                )
+            )
+
+        value = getattr(cls, name)
+
+        if not isinstance(value, _CONSTANT_TYPES):
+            raise ValueError(
+                "'%s' is not a plain constant of %s (got %r); only int/float/"
+                "str/bool/None class attributes can be mirrored onto the "
+                "prototype".format(name, getattr(cls, "__name__", cls), value)
+            )
+
+        specs.append([name, value])
+
+    return specs
 
 
 def _collect_property_specs(cls, names):
@@ -530,6 +616,48 @@ def _collect_property_specs(cls, names):
     return specs
 
 
+def _check_context(context):
+    """Validate that *context* is an entered :class:`JSContext`."""
+    if not isinstance(context, JSContext):
+        raise TypeError(
+            "context must be a STPyV8.JSContext, got %r".format(
+                getattr(type(context), "__name__", type(context))
+            )
+        )
+
+    if not JSContext.inContext:
+        raise RuntimeError(
+            "the context must be entered (use `with context:`) before "
+            "installing prototype members"
+        )
+
+
+def _resolve_js_constructor(context, cls, js_name):
+    """Return the JS constructor for *cls* as reachable under *js_name*."""
+    cls_name = getattr(cls, "__name__", cls)
+
+    try:
+        ctor = context.eval(js_name)
+    except Exception as error:  # noqa: BLE001 - re-raised with context below
+        # JS errors surface as the matching Python builtin (ReferenceError for
+        # an unknown name, ...), so this cannot be narrowed to one type.
+        raise RuntimeError(
+            "cannot find the JS constructor for {} as '{}' in this context "
+            "({}); expose the class in the context first, or pass "
+            "js_name=".format(cls_name, js_name, error)
+        )
+
+    if not isinstance(ctor, JSFunction):
+        raise RuntimeError(
+            "'{}' in this context is {}, not the JS constructor for {}; pass "
+            "js_name= if the class is exposed under another name".format(
+                js_name, getattr(type(ctor), "__name__", type(ctor)), cls_name
+            )
+        )
+
+    return ctor
+
+
 def install_property_accessors(context, cls, names=None, js_name=None):
     """Expose a class's ``@property`` descriptors as real accessor pairs on its
     JS prototype object.
@@ -559,18 +687,7 @@ def install_property_accessors(context, cls, names=None, js_name=None):
             resolve to the class's JS constructor in it.
         ValueError: *names* contains something that is not a ``@property``.
     """
-    if not isinstance(context, JSContext):
-        raise TypeError(
-            "context must be a STPyV8.JSContext, got %r".format(
-                getattr(type(context), "__name__", type(context))
-            )
-        )
-
-    if not JSContext.inContext:
-        raise RuntimeError(
-            "the context must be entered (use `with context:`) before "
-            "installing property accessors"
-        )
+    _check_context(context)
 
     cls_name = getattr(cls, "__name__", cls)
     js_name = cls_name if js_name is None else js_name
@@ -584,55 +701,92 @@ def install_property_accessors(context, cls, names=None, js_name=None):
     # the spec table travels as JSON and is parsed on the JS side.
     specs_json = json.dumps(specs)
 
-    try:
-        ctor = context.eval(js_name)
-    except Exception as error:  # noqa: BLE001 - re-raised with context below
-        # JS errors surface as the matching Python builtin (ReferenceError for
-        # an unknown name, ...), so this cannot be narrowed to one type.
-        raise RuntimeError(
-            "cannot find the JS constructor for {} as '{}' in this context "
-            "({}); expose the class in the context first, or pass "
-            "js_name=".format(cls_name, js_name, error)
-        )
-
-    if not isinstance(ctor, JSFunction):
-        raise RuntimeError(
-            "'{}' in this context is {}, not the JS constructor for {}; pass "
-            "js_name= if the class is exposed under another name".format(
-                js_name, getattr(type(ctor), "__name__", type(ctor)), cls_name
-            )
-        )
+    ctor = _resolve_js_constructor(context, cls, js_name)
 
     context.eval(_PROPERTY_ACCESSOR_PRELUDE)(ctor, specs_json, _prototype_property_get, _prototype_property_set)
 
     return [spec[0] for spec in specs]
 
 
+def install_class_attributes(context, cls, names=None, js_name=None):
+    """Mirror a class's constants onto its JS prototype object.
+
+    In real JS a class-level constant is readable both from the constructor
+    (``Node.ELEMENT_NODE``) and from the prototype (``Node.prototype.ELEMENT_NODE``).
+    The C++ side puts Python class attributes on the constructor only, so
+    ``Cls.prototype.UNSENT`` is ``undefined`` until this call. Afterwards it is a
+    non-enumerable data property, so it does not pollute ``Object.keys()`` /
+    ``for..in`` while still being readable through the prototype chain.
+
+    Only plain constants are mirrored (``int``/``float``/``str``/``bool``/``None``);
+    methods and ``@property`` belong on the prototype through their own
+    mechanisms, and classmethods / staticmethods / nested classes are statics
+    that stay on the constructor.
+
+    Args:
+        context: an entered :class:`JSContext` (``with context:``).
+        cls: the Python class whose constants to mirror.
+        names: attribute names to mirror. Defaults to every constant defined
+            along ``cls``'s MRO (most-derived definition wins).
+        js_name: the name the class's JS constructor is reachable by in
+            *context*. Defaults to ``cls.__name__``.
+
+    Returns:
+        The list of mirrored attribute names.
+
+    Raises:
+        TypeError: *context* is not a :class:`JSContext`.
+        RuntimeError: the context is not entered, or *js_name* does not
+            resolve to the class's JS constructor in it.
+        ValueError: *names* contains something that is not a plain constant.
+    """
+    _check_context(context)
+
+    cls_name = getattr(cls, "__name__", cls)
+    js_name = cls_name if js_name is None else js_name
+
+    specs = _collect_attribute_specs(cls, names)
+
+    if not specs:
+        return []
+
+    ctor = _resolve_js_constructor(context, cls, js_name)
+
+    context.eval(_CLASS_ATTRIBUTE_PRELUDE)(ctor, json.dumps(specs))
+
+    return [spec[0] for spec in specs]
+
+
 # Opt-in switch for automatic installation at context entry. Off by default on
-# purpose: installing accessors is an observable behaviour change (a prototype
-# descriptor appears where there was none, and the names become enumerable), so
-# it must not silently rewrite what existing scripts see. Set it to True to have
-# every JSContext install the @property accessors of the classes its global
-# object exposes.
+# purpose: installing prototype members is an observable behaviour change (a
+# prototype descriptor or data property appears where there was none), so it
+# must not silently rewrite what existing scripts see. Set it to True to have
+# every JSContext install, for the classes its global object exposes, the
+# @property accessors AND the class constants onto their prototypes. (Instance
+# methods are always on the prototype -- that part is unconditional.)
 #
-#     STPyV8.auto_property_accessors = True
+#     STPyV8.auto_prototype_members = True
 #
 # A class can opt out with ``__js_no_properties__ = True``; names the class hid
-# from JS (``__js_hidden__``) are never installed, as with the manual call.
+# from JS (``__js_hidden__``) are never installed, as with the manual calls.
+auto_prototype_members = False
+
+# Deprecated alias of auto_prototype_members (kept because it shipped first and
+# only controlled the @property half of the same machinery).
 auto_property_accessors = False
 
 
-def _auto_install_property_accessors(context, obj):
-    """Install @property accessors for the classes *obj* exposes to JS.
+def _auto_install_prototype_members(context, obj):
+    """Install the prototype members of the classes *obj* exposes to JS.
 
     *obj* is the global object the context was built from; every attribute that
     is a class is a constructor in the context, named after the attribute. Only
     direct attributes are considered -- classes mounted later (``locals.X = C``)
     or nested inside another object still need the explicit
-    :func:`install_property_accessors` call.
+    :func:`install_property_accessors` / :func:`install_class_attributes` calls.
     """
     if obj is None:
-        return []
+        return {}
 
     installed = {}
 
@@ -643,15 +797,21 @@ def _auto_install_property_accessors(context, obj):
         if getattr(value, "__js_no_properties__", False):
             continue
 
-        try:
-            names = install_property_accessors(context, value, js_name=name)
-        except (RuntimeError, ValueError):
-            # Not reachable as a JS constructor under this name (a plain helper
-            # class, a shadowed name, ...) -- nothing to install for it.
-            continue
+        entry = {}
 
-        if names:
-            installed[name] = names
+        for install in (install_property_accessors, install_class_attributes):
+            try:
+                names = install(context, value, js_name=name)
+            except (RuntimeError, ValueError):
+                # Not reachable as a JS constructor under this name (a plain
+                # helper class, a shadowed name, ...) -- nothing to install.
+                names = []
+
+            if names:
+                entry[install.__name__] = names
+
+        if entry:
+            installed[name] = entry
 
     return installed
 

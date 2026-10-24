@@ -1720,14 +1720,29 @@ class TestWrapper(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             STPyV8.install_property_accessors(unentered, Widget)
 
-    def testAutoPropertyAccessors(self):
-        # Opt-in automation: with STPyV8.auto_property_accessors = True, entering
-        # a context installs the @property accessors of every class its global
-        # object exposes -- no manual install_property_accessors call needed.
+    def testAutoPrototypeMembers(self):
+        # Opt-in automation: with STPyV8.auto_prototype_members = True, entering a
+        # context puts the shared members of every class its global object
+        # exposes onto that class's JS prototype -- @property accessors and class
+        # constants, on top of the instance methods that are always there.
         class Widget(STPyV8.JSClass):
+            UNSENT = 0          # class constant -> prototype + constructor
+            nodeKind = "widget"
+
             def __init__(self):
                 self._top = 0
                 self._secret = 0
+
+            def method(self):    # instance method -> prototype (always)
+                return "method"
+
+            @classmethod
+            def make(cls):
+                return "made"
+
+            @staticmethod
+            def util():
+                return "util"
 
             @property
             def scrollTop(self):
@@ -1746,6 +1761,8 @@ class TestWrapper(unittest.TestCase):
         class Private(STPyV8.JSClass):
             __js_no_properties__ = True  # opt out entirely
 
+            UNSENT = 7
+
             def __init__(self):
                 self._x = 0
 
@@ -1754,7 +1771,7 @@ class TestWrapper(unittest.TestCase):
                 return self._x
 
         class Plain(STPyV8.JSClass):
-            pass  # no properties at all
+            pass  # nothing to install
 
         class Global(STPyV8.JSClass):
             def __init__(self):
@@ -1770,12 +1787,16 @@ class TestWrapper(unittest.TestCase):
                     "Object.getOwnPropertyDescriptor(Widget.prototype, 'scrollTop') === undefined"
                 )
             )
+            self.assertTrue(ctxt.eval("Widget.prototype.UNSENT === undefined"))
 
-        previous = STPyV8.auto_property_accessors
-        STPyV8.auto_property_accessors = True
+        previous = STPyV8.auto_prototype_members
+        STPyV8.auto_prototype_members = True
         try:
             with STPyV8.JSContext(Global()) as ctxt:
-                # Installed on entry, without an explicit call.
+                # 1) instance methods: on the prototype, unconditionally.
+                self.assertEqual("function", ctxt.eval("typeof Widget.prototype.method"))
+
+                # 2) @property accessors, installed on entry without a call.
                 self.assertEqual(
                     "get:function set:function",
                     ctxt.eval(
@@ -1788,6 +1809,25 @@ class TestWrapper(unittest.TestCase):
                 ctxt.eval("var w = new Widget(); w.scrollTop = 5;")
                 self.assertEqual(5, ctxt.eval("w.scrollTop"))
                 self.assertEqual(5, ctxt.eval("w._top"))
+
+                # 3) class constants mirrored onto the prototype...
+                self.assertEqual(0, ctxt.eval("Widget.prototype.UNSENT"))
+                self.assertEqual("widget", ctxt.eval("Widget.prototype.nodeKind"))
+                self.assertEqual(0, ctxt.eval("(new Widget()).UNSENT"))
+                # ... and still on the constructor (both places, like the DOM).
+                self.assertEqual(0, ctxt.eval("Widget.UNSENT"))
+                # Non-enumerable, so Object.keys()/for..in stay clean.
+                self.assertFalse(
+                    ctxt.eval("Object.keys(Widget.prototype).indexOf('UNSENT') >= 0")
+                )
+                self.assertTrue(ctxt.eval("'UNSENT' in Widget.prototype"))
+
+                # Statics stay on the constructor only -- never on the prototype.
+                self.assertEqual("function", ctxt.eval("typeof Widget.make"))
+                self.assertEqual("function", ctxt.eval("typeof Widget.util"))
+                self.assertTrue(ctxt.eval("Widget.prototype.make === undefined"))
+                self.assertTrue(ctxt.eval("Widget.prototype.util === undefined"))
+                self.assertFalse(ctxt.eval("'util' in Widget.prototype"))
 
                 # __js_hidden__ names are never installed.
                 self.assertTrue(ctxt.eval("(new Widget()).secret === undefined"))
@@ -1803,15 +1843,16 @@ class TestWrapper(unittest.TestCase):
                         "Object.getOwnPropertyDescriptor(Private.prototype, 'value') === undefined"
                     )
                 )
+                self.assertTrue(ctxt.eval("Private.prototype.UNSENT === undefined"))
 
-                # A class without properties is simply skipped (still exposed).
+                # A class with nothing to install is simply skipped.
                 self.assertEqual("function", ctxt.eval("typeof Plain"))
                 self.assertEqual("undefined", ctxt.eval("typeof Plain.prototype.nope"))
 
                 # A non-class attribute is ignored.
                 self.assertEqual(42, ctxt.eval("notAClass"))
 
-            # Classes mounted AFTER entry still need the explicit call.
+            # Classes mounted AFTER entry still need the explicit calls.
             with STPyV8.JSContext() as ctxt:
                 ctxt.locals.Late = Widget
                 self.assertTrue(
@@ -1823,6 +1864,11 @@ class TestWrapper(unittest.TestCase):
                     ["scrollTop"],
                     STPyV8.install_property_accessors(ctxt, Widget, js_name="Late"),
                 )
+                self.assertEqual(
+                    ["UNSENT", "nodeKind"],
+                    STPyV8.install_class_attributes(ctxt, Widget, js_name="Late"),
+                )
+                self.assertEqual(0, ctxt.eval("Late.prototype.UNSENT"))
                 # The descriptor exists (reading it on the prototype object
                 # itself is an illegal invocation, as in real engines -- so check
                 # the descriptor, not a direct read).
@@ -1834,7 +1880,86 @@ class TestWrapper(unittest.TestCase):
                 )
                 self.assertEqual(0, ctxt.eval("(new Late()).scrollTop"))
         finally:
-            STPyV8.auto_property_accessors = previous
+            STPyV8.auto_prototype_members = previous
+
+    def testInstallClassAttributes(self):
+        # Manual counterpart of the automatic half: mirror a class's constants
+        # onto its prototype (readable there and on the constructor, as with
+        # Node.ELEMENT_NODE / Node.prototype.ELEMENT_NODE in browsers).
+        class Base(STPyV8.JSClass):
+            SHARED = "base"
+
+        class Widget(Base):
+            UNSENT = 0
+            nodeKind = "widget"
+            ratio = 1.5
+            flag = True
+            nothing = None
+
+            def __init__(self):
+                self._top = 0
+
+            @property
+            def scrollTop(self):
+                return self._top
+
+            @scrollTop.setter
+            def scrollTop(self, value):
+                self._top = value
+
+            def method(self):
+                return "method"
+
+            @staticmethod
+            def util():
+                return "util"
+
+        class Global(STPyV8.JSClass):
+            def __init__(self):
+                self.Widget = Widget
+
+        with STPyV8.JSContext(Global()) as ctxt:
+            self.assertEqual(
+                ["UNSENT", "nodeKind", "ratio", "flag", "nothing", "SHARED"],
+                STPyV8.install_class_attributes(ctxt, Widget),
+            )
+
+            for expression, expected in (
+                ("Widget.prototype.UNSENT", 0),
+                ("Widget.prototype.nodeKind", "widget"),
+                ("Widget.prototype.ratio", 1.5),
+                ("Widget.prototype.flag", True),
+                ("Widget.prototype.nothing", None),
+                ("Widget.prototype.SHARED", "base"),
+                ("Widget.UNSENT", 0),
+                ("(new Widget()).nodeKind", "widget"),
+            ):
+                self.assertEqual(expected, ctxt.eval(expression), expression)
+
+            # Non-constants are refused, and never silently skipped.
+            with self.assertRaises(ValueError):
+                STPyV8.install_class_attributes(ctxt, Widget, ["method"])
+            with self.assertRaises(ValueError):
+                STPyV8.install_class_attributes(ctxt, Widget, ["scrollTop"])
+            with self.assertRaises(ValueError):
+                STPyV8.install_class_attributes(ctxt, Widget, ["util"])
+            with self.assertRaises(ValueError):
+                STPyV8.install_class_attributes(ctxt, Widget, ["noSuchName"])
+
+            # The mirrored constants are read-only: an assignment through an
+            # instance is ignored (sloppy mode), so the value stays consistent
+            # everywhere -- unlike a writable prototype property, where the write
+            # would land on the Python object while reads still resolved to the
+            # prototype value.
+            ctxt.eval("var w = new Widget(); w.UNSENT = 99;")
+            self.assertEqual(0, ctxt.eval("w.UNSENT"))
+            self.assertEqual(0, ctxt.eval("Widget.prototype.UNSENT"))
+            self.assertEqual(0, ctxt.eval("(new Widget()).UNSENT"))
+            self.assertTrue(
+                ctxt.eval(
+                    "!Object.getOwnPropertyDescriptor(Widget.prototype, 'UNSENT').writable"
+                )
+            )
 
     def testClassHierarchyCallable(self):
         # `typeof` is "function" only for classes that define __call__; a plain

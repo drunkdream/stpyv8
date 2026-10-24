@@ -1166,6 +1166,61 @@ void CPythonObject::PrototypeMethod(const v8::FunctionCallbackInfo<v8::Value>& i
 // instance interceptor (HasRealNamedProperty does NOT see interceptor-forwarded
 // names, so HasRealPrototypeProperty stays false and there is no deferral), which
 // avoids the infinite recursion that real own properties would cause.
+
+// The RAW class-dict entry for `name`, walking the MRO (borrowed, nullptr when
+// absent). Needed because `getattr(cls, name)` already resolves descriptors: a
+// @staticmethod comes back as a plain function and a @classmethod as a bound
+// method, so the resolved value alone cannot tell them apart from an instance
+// method -- and those two belong on the constructor, never on the prototype.
+static PyObject *RawClassMember(py::object cls, const char *name)
+{
+    PyObject *mro = ::PyObject_GetAttrString(cls.ptr(), "__mro__");
+
+    if (!mro)
+    {
+        ::PyErr_Clear();
+        return nullptr;
+    }
+
+    PyObject *found = nullptr;
+
+    if (PyTuple_Check(mro))
+    {
+        Py_ssize_t count = PyTuple_GET_SIZE(mro);
+
+        for (Py_ssize_t i = 0; i < count && !found; ++i)
+        {
+            PyObject *base = PyTuple_GET_ITEM(mro, i); // borrowed
+
+            if (!PyType_Check(base))
+                continue;
+
+            PyObject *tp_dict = reinterpret_cast<PyTypeObject *>(base)->tp_dict;
+
+            if (tp_dict && PyDict_Check(tp_dict))
+                found = ::PyDict_GetItemString(tp_dict, name); // borrowed
+        }
+    }
+
+    Py_DECREF(mro);
+
+    return found;
+}
+
+// True when `name` is a plain instance method on the class: the RAW class-dict
+// entry (walking the MRO) is itself a function. @staticmethod / @classmethod /
+// @property wrap their payload in a descriptor object, so they are excluded --
+// and they belong on the constructor / the instance path, never on the
+// prototype. Checking the raw entry (rather than the getattr result) is what
+// makes the distinction possible: getattr(cls, name) already resolves a
+// @staticmethod to a plain function, indistinguishable from a method.
+static bool IsPlainInstanceMethod(py::object cls, const char *name)
+{
+    PyObject *raw = RawClassMember(cls, name);
+
+    return raw && PyFunction_Check(raw);
+}
+
 v8::Intercepted CPythonObject::PrototypeNamedGetter(v8::Local<v8::Name> prop, const v8::PropertyCallbackInfo<v8::Value>& info)
 {
     v8::HandleScope handle_scope(info.GetIsolate());
@@ -1225,15 +1280,23 @@ v8::Intercepted CPythonObject::PrototypeNamedGetter(v8::Local<v8::Name> prop, co
     py::object attr = py::object(py::handle<>(value));
 
     // ONLY regular instance methods are forwarded. Everything else -- notably
-    // @property descriptors, but also constants / nested classes / staticmethods
-    // -- must NOT be wrapped here: Wrap(property) instantiates a JS object for
-    // Python's built-in property type (GetClassTemplate on property), which
-    // re-enters this machinery from inside a V8 property lookup and corrupts the
-    // heap; and a wrapped constant would pose as a data property on the
-    // prototype. Let V8 resolve those normally (undefined on the prototype, as
-    // before this forwarder existed); @property access is answered on the
-    // instance path (fget/fset, see the SUPPORT_PROPERTY branches).
+    // @property descriptors, but also constants / nested classes -- must NOT be
+    // wrapped here: Wrap(property) instantiates a JS object for Python's
+    // built-in property type (GetClassTemplate on property), which re-enters
+    // this machinery from inside a V8 property lookup and corrupts the heap; and
+    // a wrapped constant would pose as a data property on the prototype. Let V8
+    // resolve those normally (undefined on the prototype, as before this
+    // forwarder existed); @property access is answered on the instance path
+    // (fget/fset, see the SUPPORT_PROPERTY branches) or by the accessors that
+    // install_property_accessors puts on the prototype.
     if (!PyFunction_Check(attr.ptr()))
+        CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Value>());
+
+    // @staticmethod / @classmethod / @property all resolve to something
+    // PyFunction_Check-friendly above, so decide on the RAW class-dict entry:
+    // only a plain instance method is forwarded. Statics stay on the
+    // constructor (PopulateStaticProperties), accessors on the instance path.
+    if (!IsPlainInstanceMethod(cls, *name))
         CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Value>());
 
     // A regular instance method -> return a self-binding function so that
@@ -1299,27 +1362,17 @@ v8::Intercepted CPythonObject::PrototypeNamedQuery(v8::Local<v8::Name> prop, con
     v8::Handle<v8::External> field = v8::Handle<v8::External>::Cast(info.Data());
     py::object cls = *static_cast<py::object *>(field->Value());
 
-    // Answer ONLY for regular instance methods -- the same set the getter
+    // Answer ONLY for plain instance methods -- the same set the getter
     // forwards (see the note there). Answering for anything else (e.g. a
-    // @property) would make V8 synthesise a data descriptor and then call the
-    // getter, which no longer handles those names. Non-enumerable, like real JS
-    // prototype methods, so `"open" in XHR.prototype` is true without polluting
-    // Object.keys().
-    {
-        PyObject *value = ::PyObject_GetAttrString(cls.ptr(), *name);
-        if (!value)
-        {
-            if (PyErr_Occurred())
-                ::PyErr_Clear();
-            CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Integer>());
-        }
-        bool is_method = PyFunction_Check(value);
-        Py_DECREF(value);
-        if (is_method)
-            CALLBACK_RETURN_HANDLED(v8::Integer::New(info.GetIsolate(), v8::DontEnum));
-    }
+    // @property, or a @staticmethod / @classmethod, which are statics and stay
+    // on the constructor) would make V8 synthesise a data descriptor and then
+    // call the getter, which does not handle those names. Non-enumerable, like
+    // real JS prototype methods, so `"open" in XHR.prototype` is true without
+    // polluting Object.keys().
+    if (!IsPlainInstanceMethod(cls, *name))
+        CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Integer>());
 
-    CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Integer>());
+    CALLBACK_RETURN_HANDLED(v8::Integer::New(info.GetIsolate(), v8::DontEnum));
 
     END_HANDLE_EXCEPTION(v8::Handle<v8::Integer>())
 }
