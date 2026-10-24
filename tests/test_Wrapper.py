@@ -1720,6 +1720,122 @@ class TestWrapper(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             STPyV8.install_property_accessors(unentered, Widget)
 
+    def testAutoPropertyAccessors(self):
+        # Opt-in automation: with STPyV8.auto_property_accessors = True, entering
+        # a context installs the @property accessors of every class its global
+        # object exposes -- no manual install_property_accessors call needed.
+        class Widget(STPyV8.JSClass):
+            def __init__(self):
+                self._top = 0
+                self._secret = 0
+
+            @property
+            def scrollTop(self):
+                return self._top
+
+            @scrollTop.setter
+            def scrollTop(self, value):
+                self._top = value
+
+            @property
+            def secret(self):
+                return self._secret
+
+        Widget.__js_hidden__ = ("secret",)
+
+        class Private(STPyV8.JSClass):
+            __js_no_properties__ = True  # opt out entirely
+
+            def __init__(self):
+                self._x = 0
+
+            @property
+            def value(self):
+                return self._x
+
+        class Plain(STPyV8.JSClass):
+            pass  # no properties at all
+
+        class Global(STPyV8.JSClass):
+            def __init__(self):
+                self.Widget = Widget
+                self.Private = Private
+                self.Plain = Plain
+                self.notAClass = 42
+
+        # Default: off -- nothing is installed behind the user's back.
+        with STPyV8.JSContext(Global()) as ctxt:
+            self.assertTrue(
+                ctxt.eval(
+                    "Object.getOwnPropertyDescriptor(Widget.prototype, 'scrollTop') === undefined"
+                )
+            )
+
+        previous = STPyV8.auto_property_accessors
+        STPyV8.auto_property_accessors = True
+        try:
+            with STPyV8.JSContext(Global()) as ctxt:
+                # Installed on entry, without an explicit call.
+                self.assertEqual(
+                    "get:function set:function",
+                    ctxt.eval(
+                        "(function () {"
+                        " var d = Object.getOwnPropertyDescriptor(Widget.prototype, 'scrollTop');"
+                        " return 'get:' + typeof d.get + ' set:' + typeof d.set;"
+                        "})()"
+                    ),
+                )
+                ctxt.eval("var w = new Widget(); w.scrollTop = 5;")
+                self.assertEqual(5, ctxt.eval("w.scrollTop"))
+                self.assertEqual(5, ctxt.eval("w._top"))
+
+                # __js_hidden__ names are never installed.
+                self.assertTrue(ctxt.eval("(new Widget()).secret === undefined"))
+                self.assertFalse(
+                    ctxt.eval(
+                        "Object.getOwnPropertyNames(Widget.prototype).indexOf('secret') >= 0"
+                    )
+                )
+
+                # __js_no_properties__ opts the class out entirely.
+                self.assertTrue(
+                    ctxt.eval(
+                        "Object.getOwnPropertyDescriptor(Private.prototype, 'value') === undefined"
+                    )
+                )
+
+                # A class without properties is simply skipped (still exposed).
+                self.assertEqual("function", ctxt.eval("typeof Plain"))
+                self.assertEqual("undefined", ctxt.eval("typeof Plain.prototype.nope"))
+
+                # A non-class attribute is ignored.
+                self.assertEqual(42, ctxt.eval("notAClass"))
+
+            # Classes mounted AFTER entry still need the explicit call.
+            with STPyV8.JSContext() as ctxt:
+                ctxt.locals.Late = Widget
+                self.assertTrue(
+                    ctxt.eval(
+                        "Object.getOwnPropertyDescriptor(Late.prototype, 'scrollTop') === undefined"
+                    )
+                )
+                self.assertEqual(
+                    ["scrollTop"],
+                    STPyV8.install_property_accessors(ctxt, Widget, js_name="Late"),
+                )
+                # The descriptor exists (reading it on the prototype object
+                # itself is an illegal invocation, as in real engines -- so check
+                # the descriptor, not a direct read).
+                self.assertEqual(
+                    "function",
+                    ctxt.eval(
+                        "typeof Object.getOwnPropertyDescriptor(Late.prototype, 'scrollTop').get"
+                    ),
+                )
+                self.assertEqual(0, ctxt.eval("(new Late()).scrollTop"))
+        finally:
+            STPyV8.auto_property_accessors = previous
+
     def testClassHierarchyCallable(self):
         # `typeof` is "function" only for classes that define __call__; a plain
         # object reports "object" and is not callable in JS (standard semantics).

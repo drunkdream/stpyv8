@@ -36,6 +36,7 @@ __all__ = [
     "JSUnlocker",
     "JSPlatform",
     "install_property_accessors",
+    "auto_property_accessors",
 ]
 
 
@@ -396,8 +397,17 @@ class JSContext(_STPyV8.JSContext):
         else:
             _STPyV8.JSContext.__init__(self, obj)
 
+        # Remembered for the opt-in auto-install of prototype property
+        # accessors (see auto_property_accessors); None when wrapping an
+        # existing context, which has no global object of its own to scan.
+        self._global_object = None if ctxt else obj
+
     def __enter__(self):
         self.enter()
+
+        if auto_property_accessors:
+            _auto_install_property_accessors(self, getattr(self, "_global_object", None))
+
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -596,6 +606,54 @@ def install_property_accessors(context, cls, names=None, js_name=None):
     context.eval(_PROPERTY_ACCESSOR_PRELUDE)(ctor, specs_json, _prototype_property_get, _prototype_property_set)
 
     return [spec[0] for spec in specs]
+
+
+# Opt-in switch for automatic installation at context entry. Off by default on
+# purpose: installing accessors is an observable behaviour change (a prototype
+# descriptor appears where there was none, and the names become enumerable), so
+# it must not silently rewrite what existing scripts see. Set it to True to have
+# every JSContext install the @property accessors of the classes its global
+# object exposes.
+#
+#     STPyV8.auto_property_accessors = True
+#
+# A class can opt out with ``__js_no_properties__ = True``; names the class hid
+# from JS (``__js_hidden__``) are never installed, as with the manual call.
+auto_property_accessors = False
+
+
+def _auto_install_property_accessors(context, obj):
+    """Install @property accessors for the classes *obj* exposes to JS.
+
+    *obj* is the global object the context was built from; every attribute that
+    is a class is a constructor in the context, named after the attribute. Only
+    direct attributes are considered -- classes mounted later (``locals.X = C``)
+    or nested inside another object still need the explicit
+    :func:`install_property_accessors` call.
+    """
+    if obj is None:
+        return []
+
+    installed = {}
+
+    for name, value in list(vars(obj).items()):
+        if not isinstance(value, type):
+            continue
+
+        if getattr(value, "__js_no_properties__", False):
+            continue
+
+        try:
+            names = install_property_accessors(context, value, js_name=name)
+        except (RuntimeError, ValueError):
+            # Not reachable as a JS constructor under this name (a plain helper
+            # class, a shadowed name, ...) -- nothing to install for it.
+            continue
+
+        if names:
+            installed[name] = names
+
+    return installed
 
 
 def icu_sync():
