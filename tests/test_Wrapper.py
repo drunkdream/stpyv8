@@ -1542,6 +1542,184 @@ class TestWrapper(unittest.TestCase):
             self.assertTrue(ctxt.eval("Element.prototype.constructor === Element"))
             self.assertTrue(ctxt.eval("Element.prototype.nope === undefined"))
 
+    def testInstallPropertyAccessors(self):
+        # A Python class's @property descriptors must be installable as REAL
+        # accessor pairs on the JS prototype, so that
+        # Object.getOwnPropertyDescriptor(Cls.prototype, "scrollTop").set is a
+        # callable -- the scroll-behavior-polyfill pattern. The C++ interceptors
+        # answer instance access only, so without install_property_accessors
+        # that descriptor is `undefined`.
+        class Widget(STPyV8.JSClass):
+            def __init__(self):
+                self._top = 0
+                self._left = 0
+                self._size = 0
+
+            @property
+            def scrollTop(self):
+                return self._top
+
+            @scrollTop.setter
+            def scrollTop(self, value):
+                self._top = value
+
+            @property
+            def scrollLeft(self):
+                return self._left
+
+            @scrollLeft.setter
+            def scrollLeft(self, value):
+                self._left = value
+
+            @property
+            def size(self):  # read-only: getter only
+                return self._size
+
+        class Global(STPyV8.JSClass):
+            def __init__(self):
+                self.Widget = Widget
+
+        with STPyV8.JSContext(Global()) as ctxt:
+            # Before: no descriptor at all on the prototype.
+            self.assertTrue(
+                ctxt.eval(
+                    "Object.getOwnPropertyDescriptor(Widget.prototype, 'scrollTop') === undefined"
+                )
+            )
+
+            installed = STPyV8.install_property_accessors(
+                ctxt, Widget, ["scrollTop", "scrollLeft", "size"]
+            )
+            self.assertEqual(["scrollTop", "scrollLeft", "size"], installed)
+
+            # The descriptor now exists with real accessors.
+            self.assertEqual(
+                "get:function set:function",
+                ctxt.eval(
+                    "(function () {"
+                    " var d = Object.getOwnPropertyDescriptor(Widget.prototype, 'scrollTop');"
+                    " return 'get:' + typeof d.get + ' set:' + typeof d.set;"
+                    "})()"
+                ),
+            )
+            # A read-only property gets a getter but no setter.
+            self.assertEqual(
+                "get:function set:undefined",
+                ctxt.eval(
+                    "(function () {"
+                    " var d = Object.getOwnPropertyDescriptor(Widget.prototype, 'size');"
+                    " return 'get:' + typeof d.get + ' set:' + typeof d.set;"
+                    "})()"
+                ),
+            )
+            # Enumerable + configurable, like the real DOM.
+            self.assertTrue(ctxt.eval("'scrollTop' in Widget.prototype"))
+            self.assertTrue(
+                ctxt.eval("Object.getOwnPropertyNames(Widget.prototype).indexOf('scrollTop') >= 0")
+            )
+            self.assertTrue(
+                ctxt.eval(
+                    "Object.getOwnPropertyDescriptor(Widget.prototype, 'scrollTop').configurable"
+                )
+            )
+
+            # Instance reads/writes run the Python fget/fset.
+            self.assertEqual(0, ctxt.eval("(new Widget()).scrollTop"))
+            ctxt.eval("var w = new Widget(); w.scrollTop = 7; w.scrollLeft = 9;")
+            self.assertEqual(7, ctxt.eval("w.scrollTop"))
+            self.assertEqual(9, ctxt.eval("w.scrollLeft"))
+            self.assertEqual(7, ctxt.eval("w._top"))
+            self.assertEqual(9, ctxt.eval("w._left"))
+            self.assertEqual(0, ctxt.eval("w.size"))
+
+            # A non-instance receiver is rejected instead of recursing.
+            self.assertTrue(
+                ctxt.eval(
+                    "(function () {"
+                    " try { Widget.prototype.scrollTop; return false; }"
+                    " catch (e) { return e instanceof TypeError; }"
+                    "})()"
+                )
+            )
+
+            # The polyfill pattern: grab the descriptor setter and wrap it.
+            ctxt.eval("var x;")
+            self.assertEqual(
+                55,
+                ctxt.eval(
+                    "(function () {"
+                    " var d = Object.getOwnPropertyDescriptor(Widget.prototype, 'scrollTop');"
+                    " if (!d || !d.set) { throw new Error('descriptor.set missing'); }"
+                    " var orig = d.set;"
+                    " Object.defineProperty(Widget.prototype, 'scrollTop', {"
+                    "   configurable: true, enumerable: true,"
+                    "   get: function () { return this._top; },"
+                    "   set: function (v) { orig.call(this, v); }"
+                    " });"
+                    " x = new Widget();"
+                    " x.scrollTop = 55;"
+                    " return x.scrollTop;"
+                    "})()"
+                ),
+            )
+            # ... and the write really reached the Python object.
+            self.assertEqual(55, ctxt.eval("x._top"))
+
+    def testInstallPropertyAccessorsDefaultsAndErrors(self):
+        class Base(STPyV8.JSClass):
+            @property
+            def hidden(self):
+                return "base-hidden"
+
+        class Widget(Base):
+            def __init__(self):
+                self._top = 0
+
+            @property
+            def scrollTop(self):
+                return self._top
+
+            @scrollTop.setter
+            def scrollTop(self, value):
+                self._top = value
+
+            @property
+            def secret(self):
+                return "nope"
+
+        Widget.__js_hidden__ = ("secret",)
+
+        class Global(STPyV8.JSClass):
+            def __init__(self):
+                self.Widget = Widget
+
+        with STPyV8.JSContext(Global()) as ctxt:
+            # No names -> every @property along the MRO, minus dunders and
+            # __js_hidden__ ones.
+            installed = STPyV8.install_property_accessors(ctxt, Widget)
+            self.assertEqual(["scrollTop", "hidden"], installed)
+
+            self.assertEqual("base-hidden", ctxt.eval("(new Widget()).hidden"))
+            # A hidden name is not installed (it stays invisible to JS).
+            self.assertFalse(
+                ctxt.eval("'secret' in Object.getOwnPropertyNames(Widget.prototype)")
+            )
+            self.assertTrue(ctxt.eval("(new Widget()).secret === undefined"))
+
+        # Bad inputs are rejected up front, not at access time.
+        with STPyV8.JSContext(Global()) as ctxt:
+            with self.assertRaises(ValueError):
+                STPyV8.install_property_accessors(ctxt, Widget, ["notAProperty"])
+            with self.assertRaises(RuntimeError):
+                STPyV8.install_property_accessors(ctxt, Widget, js_name="NoSuchName")
+            with self.assertRaises(TypeError):
+                STPyV8.install_property_accessors(object(), Widget)
+
+        # Outside `with context:` there is no context to install into.
+        unentered = STPyV8.JSContext.__new__(STPyV8.JSContext)
+        with self.assertRaises(RuntimeError):
+            STPyV8.install_property_accessors(unentered, Widget)
+
     def testClassHierarchyCallable(self):
         # `typeof` is "function" only for classes that define __call__; a plain
         # object reports "object" and is not callable in JS (standard semantics).

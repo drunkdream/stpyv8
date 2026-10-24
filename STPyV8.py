@@ -7,6 +7,7 @@ from __future__ import print_function
 import os
 import sys
 import re
+import json
 import collections.abc
 
 import _STPyV8
@@ -34,6 +35,7 @@ __all__ = [
     "JSLocker",
     "JSUnlocker",
     "JSPlatform",
+    "install_property_accessors",
 ]
 
 
@@ -406,6 +408,194 @@ class JSContext(_STPyV8.JSContext):
             self.lock = None
 
         del self
+
+
+# ---------------------------------------------------------------------------
+# Prototype property accessors
+# ---------------------------------------------------------------------------
+
+# Installed on a class's JS prototype object by install_property_accessors().
+# The accessors bridge back into Python with plain getattr()/setattr(), so the
+# class's @property fget/fset run exactly as they do for an instance-level
+# access: when the accessor fires, `this` is the wrapped instance and STPyV8
+# hands it to Python as the underlying Python object.
+#
+# Why this is needed: the C++ named-property interceptors answer *instance*
+# access only. V8 never promotes those names onto the prototype object, so
+# Object.getOwnPropertyDescriptor(Cls.prototype, "scrollTop") is `undefined`
+# and libraries that grab the descriptor and wrap it -- scroll-behavior-
+# polyfill and friends -- have nothing to call. Installing real accessor pairs
+# makes the descriptor exist, and instance access keeps working because the
+# instance interceptors already defer to real prototype accessors.
+_PROPERTY_ACCESSOR_PRELUDE = """
+(function (ctor, specsJson, get, set) {
+    var specs = JSON.parse(specsJson);
+    var proto = ctor.prototype;
+
+    for (var i = 0; i < specs.length; i++) {
+        (function (name, hasGetter, hasSetter) {
+            var desc = {
+                configurable: true,
+                enumerable: true,
+                get: function () { return get(this, name); }
+            };
+
+            if (hasSetter) {
+                desc.set = function (value) { set(this, name, value); };
+            }
+
+            Object.defineProperty(proto, name, desc);
+        })(specs[i][0], specs[i][1], specs[i][2]);
+    }
+});
+"""
+
+
+def _prototype_property_get(obj, name):
+    # A JS-object receiver (Cls.prototype itself, or
+    # descriptor.get.call(someJSObject, ...)) must be rejected: getattr() on a
+    # CJavascriptObject would re-enter the very accessor being run and recurse
+    # forever. Real engines reject that call too ("Illegal invocation").
+    if isinstance(obj, JSObject):
+        raise TypeError(
+            "property '%s' cannot be read on this receiver; it belongs to "
+            "instances of the exposed Python class" % name
+        )
+
+    return getattr(obj, name)
+
+
+def _prototype_property_set(obj, name, value):
+    if isinstance(obj, JSObject):
+        raise TypeError(
+            "property '%s' cannot be written on this receiver; it belongs to "
+            "instances of the exposed Python class" % name
+        )
+
+    setattr(obj, name, value)
+
+
+def _collect_property_specs(cls, names):
+    """Return ``[[name, has_getter, has_setter], ...]`` for *cls*' properties.
+
+    With *names* omitted every ``@property`` along the MRO is collected
+    (most-derived definition wins, each name once), skipping dunders and the
+    names the class hid from JS via ``__js_hidden__``.
+    """
+    hidden = set()
+
+    for base in getattr(cls, "__mro__", (cls,)):
+        hidden.update(getattr(base, "__js_hidden__", ()) or ())
+
+    if names is None:
+        names = []
+        seen = set()
+
+        for base in getattr(cls, "__mro__", (cls,)):
+            for name, value in vars(base).items():
+                if name.startswith("__") or name in hidden or name in seen:
+                    continue
+
+                if not isinstance(value, property):
+                    continue
+
+                seen.add(name)
+                names.append(name)
+
+    specs = []
+
+    for name in names:
+        prop = getattr(cls, name, None)
+
+        if not isinstance(prop, property):
+            raise ValueError(
+                "'%s' is not a @property of %s (got %r); pass the names of "
+                "properties defined on the class".format(
+                    name, getattr(cls, "__name__", cls), prop
+                )
+            )
+
+        specs.append([name, prop.fget is not None, prop.fset is not None])
+
+    return specs
+
+
+def install_property_accessors(context, cls, names=None, js_name=None):
+    """Expose a class's ``@property`` descriptors as real accessor pairs on its
+    JS prototype object.
+
+    The C++ interceptors answer instance access only, so before this call
+    ``Object.getOwnPropertyDescriptor(Cls.prototype, "scrollTop")`` is
+    ``undefined`` and code that grabs the descriptor -- e.g.
+    ``... .set`` in scroll-behavior-polyfill -- has nothing to call. Afterwards
+    the descriptor exists, its get/set run the Python ``fget``/``fset``, and
+    instance access is unchanged.
+
+    Args:
+        context: an entered :class:`JSContext` (``with context:``).
+        cls: the Python class whose ``@property`` descriptors to expose.
+        names: property names to expose. Defaults to every ``@property``
+            defined along ``cls``'s MRO (read-only ones get a getter only).
+        js_name: the name the class's JS constructor is reachable by in
+            *context*. Defaults to ``cls.__name__``; pass it when the class is
+            exposed under another name (a dotted path works too).
+
+    Returns:
+        The list of installed property names.
+
+    Raises:
+        TypeError: *context* is not a :class:`JSContext`.
+        RuntimeError: the context is not entered, or *js_name* does not
+            resolve to the class's JS constructor in it.
+        ValueError: *names* contains something that is not a ``@property``.
+    """
+    if not isinstance(context, JSContext):
+        raise TypeError(
+            "context must be a STPyV8.JSContext, got %r".format(
+                getattr(type(context), "__name__", type(context))
+            )
+        )
+
+    if not JSContext.inContext:
+        raise RuntimeError(
+            "the context must be entered (use `with context:`) before "
+            "installing property accessors"
+        )
+
+    cls_name = getattr(cls, "__name__", cls)
+    js_name = cls_name if js_name is None else js_name
+
+    specs = _collect_property_specs(cls, names)
+
+    if not specs:
+        return []
+
+    # A Python list is exposed to JS with indexed access only (no .length), so
+    # the spec table travels as JSON and is parsed on the JS side.
+    specs_json = json.dumps(specs)
+
+    try:
+        ctor = context.eval(js_name)
+    except Exception as error:  # noqa: BLE001 - re-raised with context below
+        # JS errors surface as the matching Python builtin (ReferenceError for
+        # an unknown name, ...), so this cannot be narrowed to one type.
+        raise RuntimeError(
+            "cannot find the JS constructor for {} as '{}' in this context "
+            "({}); expose the class in the context first, or pass "
+            "js_name=".format(cls_name, js_name, error)
+        )
+
+    if not isinstance(ctor, JSFunction):
+        raise RuntimeError(
+            "'{}' in this context is {}, not the JS constructor for {}; pass "
+            "js_name= if the class is exposed under another name".format(
+                js_name, getattr(type(ctor), "__name__", type(ctor)), cls_name
+            )
+        )
+
+    context.eval(_PROPERTY_ACCESSOR_PRELUDE)(ctor, specs_json, _prototype_property_get, _prototype_property_set)
+
+    return [spec[0] for spec in specs]
 
 
 def icu_sync():
