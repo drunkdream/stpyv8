@@ -20,6 +20,7 @@ __all__ = [
     "DontDelete",
     "Internal",
     "JSError",
+    "UnhandledRejection",
     "JSObject",
     "JSNull",
     "JSUndefined",
@@ -195,6 +196,19 @@ class JSUnlocker(_STPyV8.JSUnlocker):
 
     def __bool__(self):
         return self.entered()
+
+
+class UnhandledRejection(Exception):
+    """A promise rejected and nothing handled it.
+
+    Raised by :meth:`JSContext.drain`. ``rejections`` holds the reported
+    entries (dicts with ``message``, ``stack`` and ``description``), ``str()``
+    of the exception is their joined description.
+    """
+
+    def __init__(self, message, rejections):
+        Exception.__init__(self, message)
+        self.rejections = rejections
 
 
 class JSClass:
@@ -411,6 +425,49 @@ class JSContext(_STPyV8.JSContext):
             _auto_install_prototype_members(self, getattr(self, "_global_object", None))
 
         return self
+
+    # -- Promise rejection / microtask plumbing --------------------------
+    #
+    # A bare V8 embed has no event loop and no 'unhandledrejection' event, so
+    # without these a rejected promise that nobody handles is simply lost: the
+    # host cannot tell "the app crashed" from "everything is fine". The isolate
+    # records unhandled rejections (V8's SetPromiseRejectCallback) and
+    # run_microtasks() drives the promise chain deterministically.
+    def run_microtasks(self):
+        """Run the microtask queue to completion (drains pending .then chains)."""
+        JSIsolate.runMicrotasks()
+
+    @property
+    def pending_rejections(self):
+        """Unhandled promise rejections recorded on this isolate (oldest first).
+
+        Each entry is a dict with ``message``, ``stack`` and ``description``.
+        A rejection withdraws itself as soon as a handler is attached, so what
+        is listed here really is unhandled.
+        """
+        return JSIsolate.pendingRejections
+
+    def clear_rejections(self):
+        """Forget the recorded rejections (call once they have been reported)."""
+        JSIsolate.clearPendingRejections()
+
+    def drain(self):
+        """Run microtasks, then raise if anything was left unhandled.
+
+        Convenience wrapper for hosts that want the common policy: "let the
+        promise chain finish; if it rejected unhandled, that is an error".
+        """
+        self.run_microtasks()
+        pending = self.pending_rejections
+
+        if not pending:
+            return []
+
+        self.clear_rejections()
+
+        raise UnhandledRejection(
+            "; ".join(entry["description"] for entry in pending), pending
+        )
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.leave()

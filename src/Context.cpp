@@ -29,6 +29,20 @@ void CContext::Expose(void)
     .def("leave", &CIsolate::Leave,
          "Exits this isolate by restoring the previously entered one in the current thread. "
          "The isolate may still stay the same, if it was entered more than once.")
+
+    .add_static_property("pendingRejections", &CIsolate::GetPendingRejections,
+                         "Unhandled promise rejections seen on this isolate, oldest first. "
+                         "Each entry is a dict with 'message', 'stack' and 'description'. "
+                         "Use clearPendingRejections() once they have been reported.")
+
+    .def("clearPendingRejections", &CIsolate::ClearPendingRejections,
+         "Forget the unhandled promise rejections recorded for this isolate.")
+    .staticmethod("clearPendingRejections")
+
+    .def("runMicrotasks", &CIsolate::RunMicrotasks,
+         "Run the microtask queue of the current isolate to completion, so a promise "
+         "chain started by eval() actually progresses.")
+    .staticmethod("runMicrotasks")
     ;
 
     py::class_<CContext, boost::noncopyable>("JSContext", "JSContext is an execution context.", py::no_init)
