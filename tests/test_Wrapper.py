@@ -1579,6 +1579,13 @@ class TestWrapper(unittest.TestCase):
             def __init__(self):
                 self.Widget = Widget
 
+        # This test covers the MANUAL call, so turn the automatic installation
+        # off to observe the "no descriptor yet" starting point.
+        previous = STPyV8.auto_prototype_members
+        previous_alias = STPyV8.auto_property_accessors
+        STPyV8.auto_prototype_members = False
+        STPyV8.auto_property_accessors = False
+
         with STPyV8.JSContext(Global()) as ctxt:
             # Before: no descriptor at all on the prototype.
             self.assertTrue(
@@ -1664,6 +1671,9 @@ class TestWrapper(unittest.TestCase):
             )
             # ... and the write really reached the Python object.
             self.assertEqual(55, ctxt.eval("x._top"))
+
+        STPyV8.auto_prototype_members = previous
+        STPyV8.auto_property_accessors = previous_alias
 
     def testInstallPropertyAccessorsDefaultsAndErrors(self):
         class Base(STPyV8.JSClass):
@@ -1780,16 +1790,36 @@ class TestWrapper(unittest.TestCase):
                 self.Plain = Plain
                 self.notAClass = 42
 
-        # Default: off -- nothing is installed behind the user's back.
+        # Default: ON -- the descriptors exist without any explicit call, because
+        # without them every descriptor-grabbing library falls over.
+        self.assertTrue(STPyV8.auto_prototype_members)
         with STPyV8.JSContext(Global()) as ctxt:
-            self.assertTrue(
+            self.assertFalse(
                 ctxt.eval(
                     "Object.getOwnPropertyDescriptor(Widget.prototype, 'scrollTop') === undefined"
                 )
             )
-            self.assertTrue(ctxt.eval("Widget.prototype.UNSENT === undefined"))
+            self.assertFalse(ctxt.eval("Widget.prototype.UNSENT === undefined"))
 
+        # Opting out globally restores the old (descriptor-less) behaviour.
         previous = STPyV8.auto_prototype_members
+        previous_alias = STPyV8.auto_property_accessors
+        STPyV8.auto_prototype_members = False
+        STPyV8.auto_property_accessors = False
+        try:
+            with STPyV8.JSContext(Global()) as ctxt:
+                self.assertTrue(
+                    ctxt.eval(
+                        "Object.getOwnPropertyDescriptor(Widget.prototype, 'scrollTop') === undefined"
+                    )
+                )
+                self.assertTrue(ctxt.eval("Widget.prototype.UNSENT === undefined"))
+                # Instance access still works, as always.
+                self.assertEqual(0, ctxt.eval("(new Widget()).scrollTop"))
+        finally:
+            STPyV8.auto_prototype_members = previous
+            STPyV8.auto_property_accessors = previous_alias
+
         STPyV8.auto_prototype_members = True
         try:
             with STPyV8.JSContext(Global()) as ctxt:

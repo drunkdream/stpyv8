@@ -757,23 +757,32 @@ def install_class_attributes(context, cls, names=None, js_name=None):
     return [spec[0] for spec in specs]
 
 
-# Opt-in switch for automatic installation at context entry. Off by default on
-# purpose: installing prototype members is an observable behaviour change (a
-# prototype descriptor or data property appears where there was none), so it
-# must not silently rewrite what existing scripts see. Set it to True to have
-# every JSContext install, for the classes its global object exposes, the
-# @property accessors AND the class constants onto their prototypes. (Instance
-# methods are always on the prototype -- that part is unconditional.)
+# Automatic installation at context entry. ON by default: entering a JSContext
+# installs, for the classes its global object exposes, the @property accessors
+# AND the class constants onto their prototypes (instance methods are always on
+# the prototype -- that part is unconditional C++ behaviour).
 #
-#     STPyV8.auto_prototype_members = True
+# On by default because the alternative is silently broken for consumers:
+# Python @property is only intercepted for *instance* access, so without this
+# Object.getOwnPropertyDescriptor(Cls.prototype, "scrollTop") and
+# Cls.prototype.__lookupGetter__("scrollTop") are `undefined`, and any library
+# that grabs the descriptor (scroll-behavior-polyfill and friends) falls over.
+# Enumerating the names by hand is not viable (a DOM-ish class hierarchy has
+# hundreds of @property across its MRO), so the default has to be "install
+# everything". Instance reads/writes behave exactly as before -- this only adds
+# the descriptors that were missing.
 #
-# A class can opt out with ``__js_no_properties__ = True``; names the class hid
-# from JS (``__js_hidden__``) are never installed, as with the manual calls.
-auto_prototype_members = False
+#     STPyV8.auto_prototype_members = False    # opt out globally
+#
+# A single class can opt out with ``__js_no_properties__ = True``; names the
+# class hid from JS (``__js_hidden__``) are never installed, as with the manual
+# calls.
+auto_prototype_members = True
 
 # Deprecated alias of auto_prototype_members (kept because it shipped first and
-# only controlled the @property half of the same machinery).
-auto_property_accessors = False
+# only controlled the @property half of the same machinery). Setting it to False
+# does NOT disable the automation -- use auto_prototype_members for that.
+auto_property_accessors = True
 
 
 def _auto_install_prototype_members(context, obj):
