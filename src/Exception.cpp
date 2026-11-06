@@ -311,7 +311,20 @@ const std::string CJavascriptException::Extract(v8::Isolate *isolate, v8::TryCat
         {
             v8::String::Utf8Value line(isolate, message->GetSourceLine(isolate->GetCurrentContext()).ToLocalChecked());
 
-            oss << " -> " << std::string(*line, line.length());
+            if (*line)
+            {
+                // 压缩后的 bundle 常是单行数 MB，整行拼进异常消息会让每次
+                // 异常都分配 MB 级字符串（实测 1.8MB 源码 -> 1.8MB 异常串），
+                // 高频抛异常时直接把 V8 堆撑爆（sports.qq.com OOM 的根因）。
+                // 截断到 200 字符足够定位出错位置。
+                const size_t kMax = 200;
+                size_t n = (size_t) line.length();
+
+                oss << " -> " << std::string(*line, n > kMax ? kMax : n);
+
+                if (n > kMax)
+                    oss << "... (" << n << " chars)";
+            }
         }
     }
 
