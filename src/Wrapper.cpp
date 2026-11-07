@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 #include <iostream>
+#include <unordered_set>
 #include <vector>
 #include <string>
 
@@ -13,6 +14,153 @@
 
 #include "Context.h"
 #include "Utils.h"
+
+
+namespace
+{
+// Owned-forever payload for the real AccessorPair / prototype method installed
+// on a class's PrototypeTemplate (same External pattern as CallHandler).
+struct PrototypeAccessorData
+{
+    py::object cls;
+    std::string name;
+};
+
+struct ClassTemplateEntry
+{
+    // Keeps the class alive so its address stays a stable cache key.
+    py::object cls;
+    std::unique_ptr<v8::Persistent<v8::FunctionTemplate>> tmpl;
+};
+
+// Everything allocated for one v8::Isolate. V8 frees its own handles when the
+// isolate is disposed, but the C++/Python objects behind those handles are
+// ours; they must be released BEFORE Dispose() so the Persistents can still be
+// Reset() safely.
+struct IsolateState
+{
+    std::unique_ptr<v8::Persistent<v8::ObjectTemplate>> objectTemplate;
+    std::unordered_map<PyObject *, ClassTemplateEntry> classTemplates;
+    std::vector<std::unique_ptr<py::object>> callPayloads;
+    std::vector<std::unique_ptr<PrototypeAccessorData>> accessorPayloads;
+#ifdef SUPPORT_TRACE_LIFECYCLE
+    std::unordered_set<ContextTracer *> tracers;
+#endif
+};
+
+std::recursive_mutex s_isolateMutex;
+std::unordered_map<v8::Isolate *, std::unique_ptr<IsolateState>> s_isolateStates;
+
+// Caller must hold s_isolateMutex.
+IsolateState& StateFor(v8::Isolate *isolate)
+{
+    auto it = s_isolateStates.find(isolate);
+
+    if (it == s_isolateStates.end())
+        it = s_isolateStates.emplace(
+            isolate, std::make_unique<IsolateState>()).first;
+
+    return *it->second;
+}
+
+py::object *OwnCallPayload(v8::Isolate *isolate, py::object cls)
+{
+    std::lock_guard<std::recursive_mutex> lock(s_isolateMutex);
+
+    std::unique_ptr<py::object> payload(new py::object(cls));
+    py::object *raw = payload.get();
+
+    StateFor(isolate).callPayloads.push_back(std::move(payload));
+
+    return raw;
+}
+
+PrototypeAccessorData *OwnAccessorPayload(v8::Isolate *isolate, py::object cls,
+                                          const std::string& name)
+{
+    std::lock_guard<std::recursive_mutex> lock(s_isolateMutex);
+
+    std::unique_ptr<PrototypeAccessorData> data(
+        new PrototypeAccessorData{cls, name});
+    PrototypeAccessorData *raw = data.get();
+
+    StateFor(isolate).accessorPayloads.push_back(std::move(data));
+
+    return raw;
+}
+
+#ifdef SUPPORT_TRACE_LIFECYCLE
+void RegisterContextTracer(v8::Isolate *isolate, ContextTracer *tracer)
+{
+    std::lock_guard<std::recursive_mutex> lock(s_isolateMutex);
+
+    StateFor(isolate).tracers.insert(tracer);
+}
+
+void UnregisterContextTracer(v8::Isolate *isolate, ContextTracer *tracer)
+{
+    std::lock_guard<std::recursive_mutex> lock(s_isolateMutex);
+
+    auto it = s_isolateStates.find(isolate);
+
+    if (it != s_isolateStates.end())
+        it->second->tracers.erase(tracer);
+}
+#endif
+}  // namespace
+
+void IsolateRegistry::Register(v8::Isolate *isolate)
+{
+    std::lock_guard<std::recursive_mutex> lock(s_isolateMutex);
+
+    StateFor(isolate);
+}
+
+bool IsolateRegistry::IsAlive(v8::Isolate *isolate)
+{
+    std::lock_guard<std::recursive_mutex> lock(s_isolateMutex);
+
+    return s_isolateStates.find(isolate) != s_isolateStates.end();
+}
+
+void IsolateRegistry::Forget(v8::Isolate *isolate)
+{
+    CPythonGIL python_gil;
+
+    std::unique_ptr<IsolateState> state;
+
+    {
+        std::lock_guard<std::recursive_mutex> lock(s_isolateMutex);
+
+        auto it = s_isolateStates.find(isolate);
+
+        if (it == s_isolateStates.end())
+            return;
+
+        state = std::move(it->second);
+        s_isolateStates.erase(it);
+    }
+
+#ifdef SUPPORT_TRACE_LIFECYCLE
+    // Release every wrapped Python object while the isolate is still alive,
+    // then cancel the context tracers' weak callbacks.
+    std::vector<ContextTracer *> tracers(
+        state->tracers.begin(), state->tracers.end());
+
+    state->tracers.clear();
+
+    for (ContextTracer *tracer : tracers)
+    {
+        tracer->Dispose();
+        delete tracer;
+    }
+#endif
+
+    state->classTemplates.clear();
+    state->objectTemplate.reset();
+    state->callPayloads.clear();
+    state->accessorPayloads.clear();
+}
 
 
 #define TERMINATE_EXECUTION_CHECK(returnValue) \
@@ -1102,16 +1250,34 @@ void CPythonObject::Caller(const v8::FunctionCallbackInfo<v8::Value>& info)
         self = CJavascriptObject::Wrap(info.This());
     }
 
-    py::object result;
+    // Forward every argument. The old BOOST_PP_FOR((0, 10)) unrolled a fixed
+    // 0..10 switch and threw "too many arguments" beyond ten, which broke
+    // legitimate calls (addEventListener with many options, generated bridges,
+    // Promise combinators, ...). PyObject_CallObject has no such limit.
+    Py_ssize_t argc = info.Length();
+    PyObject *raw_args = PyTuple_New(argc);
 
-    switch (info.Length())
+    if (!raw_args)
+        throw py::error_already_set();
+
+    // `args` owns raw_args from here on, so an exception raised while wrapping
+    // an argument still releases the tuple.
+    py::object args = py::object(py::handle<>(raw_args));
+
+    for (Py_ssize_t i = 0; i < argc; ++i)
     {
-        BOOST_PP_FOR((0, 10), GEN_CASE_PRED, GEN_CASE_OP, GEN_CASE_MACRO)
-    default:
-        info.GetIsolate()->ThrowException(v8::Exception::Error(v8::String::NewFromUtf8(info.GetIsolate(), "too many arguments").ToLocalChecked()));
+        py::object item = CJavascriptObject::Wrap(info[i]);
 
-        CALLBACK_RETURN_NO_INTERCEPT(v8::Undefined(info.GetIsolate()));
+        Py_INCREF(item.ptr());
+        PyTuple_SET_ITEM(raw_args, i, item.ptr());
     }
+
+    PyObject *called = PyObject_CallObject(self.ptr(), args.ptr());
+
+    if (!called)
+        throw py::error_already_set();
+
+    py::object result = py::object(py::handle<>(called));
 
     CALLBACK_RETURN_NO_INTERCEPT(Wrap(result));
 
@@ -1179,14 +1345,6 @@ static void ThrowIllegalInvocation(v8::Isolate *isolate)
         v8::String::NewFromUtf8Literal(isolate, "Illegal invocation")));
 }
 
-// Owned-forever payload for the real AccessorPair / prototype method installed
-// on a class's PrototypeTemplate (same External pattern as CallHandler).
-struct PrototypeAccessorData
-{
-    py::object cls;
-    std::string name;
-};
-
 // Call handler for a real prototype method (PopulatePrototypeMethods).
 // `self` is bound from the resolved Python receiver at call time, so both
 // `Class.prototype.method.apply(instance, args)` and a bare global function
@@ -1222,16 +1380,33 @@ void CPythonObject::PrototypeMethod(const v8::FunctionCallbackInfo<v8::Value>& i
     // raise; the surrounding TRY_HANDLE_EXCEPTION turns that into a JS exception.
     py::object self = receiver.attr(name.c_str());
 
-    py::object result;
+    // Forward every argument (see the matching note in Caller): the old
+    // BOOST_PP_FOR((0, 10)) switch capped prototype methods at ten arguments
+    // and threw "too many arguments" beyond that.
+    Py_ssize_t argc = info.Length();
+    PyObject *raw_args = PyTuple_New(argc);
 
-    switch (info.Length())
+    if (!raw_args)
+        throw py::error_already_set();
+
+    // `args` owns raw_args from here on, so an exception raised while wrapping
+    // an argument still releases the tuple.
+    py::object args = py::object(py::handle<>(raw_args));
+
+    for (Py_ssize_t i = 0; i < argc; ++i)
     {
-        BOOST_PP_FOR((0, 10), GEN_CASE_PRED, GEN_CASE_OP, GEN_CASE_MACRO)
-    default:
-        info.GetIsolate()->ThrowException(v8::Exception::Error(v8::String::NewFromUtf8(info.GetIsolate(), "too many arguments").ToLocalChecked()));
+        py::object item = CJavascriptObject::Wrap(info[i]);
 
-        CALLBACK_RETURN_NO_INTERCEPT(v8::Undefined(info.GetIsolate()));
+        Py_INCREF(item.ptr());
+        PyTuple_SET_ITEM(raw_args, i, item.ptr());
     }
+
+    PyObject *called = PyObject_CallObject(self.ptr(), args.ptr());
+
+    if (!called)
+        throw py::error_already_set();
+
+    py::object result = py::object(py::handle<>(called));
 
     CALLBACK_RETURN_NO_INTERCEPT(Wrap(result));
 
@@ -1390,9 +1565,12 @@ void CPythonObject::PopulatePrototypeMethods(v8::Isolate *isolate, py::object cl
         if (!text) continue;
         std::string name(text);
 
-        // Dunders, the two native prototype names, and __js_hidden__ entries
-        // are Python-side policy and never become JS prototype members.
-        if (name.empty() || name.compare(0, 2, "__") == 0 ||
+        // Dunders, single-underscore private members, the two native prototype
+        // names, and __js_hidden__ entries are Python-side policy and never
+        // become JS prototype members. The `_` prefix matters just as much as
+        // `__`: without it `_private_helper`-style names and friends leaked onto
+        // every wrapped prototype and were enumerable from JS.
+        if (name.empty() || name[0] == '_' ||
             name == "constructor" || name == "prototype" ||
             ClassHidesName(cls, name))
             continue;
@@ -1448,14 +1626,14 @@ void CPythonObject::PopulatePrototypeMethods(v8::Isolate *isolate, py::object cl
             v8::Local<v8::FunctionTemplate> getter, setter;
             if (m.has_getter)
             {
-                auto *data = new PrototypeAccessorData{cls, m.name};
+                auto *data = OwnAccessorPayload(isolate, cls, m.name);
                 getter = v8::FunctionTemplate::New(
                     isolate, &CPythonObject::PrototypeAccessorGet,
                     v8::External::New(isolate, data));
             }
             if (m.has_setter)
             {
-                auto *data = new PrototypeAccessorData{cls, m.name};
+                auto *data = OwnAccessorPayload(isolate, cls, m.name);
                 setter = v8::FunctionTemplate::New(
                     isolate, &CPythonObject::PrototypeAccessorSet,
                     v8::External::New(isolate, data));
@@ -1466,7 +1644,7 @@ void CPythonObject::PopulatePrototypeMethods(v8::Isolate *isolate, py::object cl
         {
             // A method is a real, enumerable data property whose value is a
             // self-binding function (receiver -> Python instance at call time).
-            auto *data = new PrototypeAccessorData{cls, m.name};  // owned forever
+            auto *data = OwnAccessorPayload(isolate, cls, m.name);
             v8::Local<v8::FunctionTemplate> fn = v8::FunctionTemplate::New(
                 isolate, &CPythonObject::PrototypeMethod,
                 v8::External::New(isolate, data));
@@ -1553,52 +1731,32 @@ v8::Local<v8::ObjectTemplate> CPythonObject::GetObjectTemplate(v8::Isolate *isol
     // that created it, so sharing a single (function-local static) template
     // across isolates makes V8 clone a cached instantiation whose map belongs to
     // a foreign isolate (tripping `is_clonable_js_type`).
-    static std::mutex s_mutex;
-    // v8::Persistent is non-copyable (and non-movable) in this V8, so it cannot
-    // be moved into a map element; hold it behind a unique_ptr instead.
-    static std::unordered_map<v8::Isolate *, std::unique_ptr<v8::Persistent<v8::ObjectTemplate>>> s_cache;
+    // The registry owns the template so it can be Reset() before Dispose().
+    std::lock_guard<std::recursive_mutex> lock(s_isolateMutex);
 
-    std::lock_guard<std::mutex> lock(s_mutex);
+    IsolateState& state = StateFor(isolate);
 
-    auto it = s_cache.find(isolate);
-
-    if (it == s_cache.end())
+    if (!state.objectTemplate)
     {
-        it = s_cache.emplace(
-            isolate,
+        state.objectTemplate =
             std::make_unique<v8::Persistent<v8::ObjectTemplate>>(
-                isolate, CreateObjectTemplate(isolate))
-        ).first;
+                isolate, CreateObjectTemplate(isolate));
     }
 
-    return v8::Local<v8::ObjectTemplate>::New(isolate, *it->second);
+    return v8::Local<v8::ObjectTemplate>::New(isolate, *state.objectTemplate);
 }
-
-namespace
-{
-struct ClassTemplateEntry
-{
-    // Keeps the class alive so its address stays a stable cache key.
-    py::object cls;
-    std::unique_ptr<v8::Persistent<v8::FunctionTemplate>> tmpl;
-};
-}  // namespace
 
 v8::Local<v8::FunctionTemplate> CPythonObject::GetClassTemplate(v8::Isolate *isolate, py::object cls)
 {
     // A v8::FunctionTemplate is bound to the isolate that created it, so cache
     // one per (isolate, class). recursive_mutex because building a template
     // recurses into the templates of its base classes.
-    static std::recursive_mutex s_mutex;
-    static std::unordered_map<
-        v8::Isolate *,
-        std::unordered_map<PyObject *, ClassTemplateEntry>> s_cache;
-
-    std::lock_guard<std::recursive_mutex> lock(s_mutex);
+    std::lock_guard<std::recursive_mutex> lock(s_isolateMutex);
 
     v8::EscapableHandleScope handle_scope(isolate);
 
-    auto &per_isolate = s_cache[isolate];
+    // Registry-owned, so the templates die with their isolate.
+    auto &per_isolate = StateFor(isolate).classTemplates;
     auto it = per_isolate.find(cls.ptr());
     if (it != per_isolate.end())
     {
@@ -1635,7 +1793,7 @@ v8::Local<v8::FunctionTemplate> CPythonObject::GetClassTemplate(v8::Isolate *iso
 
     // Calling the exposed class instantiates the Python class (as before). The
     // class *function* stays callable regardless of whether its instances are.
-    tmpl->SetCallHandler(Caller, v8::External::New(isolate, new py::object(cls)));
+    tmpl->SetCallHandler(Caller, v8::External::New(isolate, OwnCallPayload(isolate, cls)));
 
     // `typeof` is "function" only for genuinely callable objects. Make the
     // instances callable only when the Python class defines __call__ (tp_call
@@ -2850,17 +3008,61 @@ ObjectTracer::ObjectTracer(v8::Handle<v8::Value> handle, py::object *object)
 ObjectTracer::~ObjectTracer()
 {
     if (!m_handle.IsEmpty())
-    {
         Dispose();
 
+    // The owning LivingMap may already be gone when the tracer is destroyed
+    // from ContextTracer's teardown (which clears the map first).
+    if (m_living && m_object)
         m_living->erase(m_object->ptr());
-    }
 }
 
 void ObjectTracer::Dispose(void)
 {
-    m_handle.ClearWeak();
+    // Reset() detaches the handle and cancels any pending weak callback, which
+    // is all that is needed. Do NOT call ClearWeak() here: when this runs from
+    // the weak callback itself, V8 has already detached the handle, and
+    // ClearWeak() would touch a freed global-handle node (SIGSEGV inside
+    // GlobalHandles::ClearWeakness).
     m_handle.Reset();
+}
+
+void ObjectTracer::DisposeContext(v8::Isolate *isolate, v8::Handle<v8::Context> ctxt)
+{
+    CPythonGIL python_gil;
+
+    v8::HandleScope handle_scope(isolate);
+
+    v8::Local<v8::Object> global = ctxt->Global();
+
+    v8::Local<v8::String> tracerName =
+        v8::String::NewFromUtf8(isolate, "__ctx_tracer__").ToLocalChecked();
+    v8::Local<v8::Private> tracerKey = v8::Private::ForApi(isolate, tracerName);
+
+    v8::MaybeLocal<v8::Value> maybe = global->GetPrivate(ctxt, tracerKey);
+
+    if (maybe.IsEmpty())
+        return;
+
+    v8::Local<v8::Value> value = maybe.ToLocalChecked();
+
+    if (!value->IsExternal())
+        return;
+
+    ContextTracer *tracer =
+        static_cast<ContextTracer *>(v8::Local<v8::External>::Cast(value)->Value());
+
+    global->DeletePrivate(ctxt, tracerKey);
+
+    // Drop the map reference too, so a later lookup cannot resurrect it.
+    v8::Local<v8::String> livingName =
+        v8::String::NewFromUtf8(isolate, "__living__").ToLocalChecked();
+    global->DeletePrivate(ctxt, v8::Private::ForApi(isolate, livingName));
+
+    if (tracer)
+    {
+        tracer->Dispose();  // cancel the weak callback while ctxt is valid
+        delete tracer;      // releases every owned ObjectTracer / py::object
+    }
 }
 
 ObjectTracer& ObjectTracer::Trace(v8::Handle<v8::Value> handle, py::object *object)
@@ -2884,7 +3086,13 @@ void ObjectTracer::WeakCallback(const v8::WeakCallbackInfo<ObjectTracer>& info)
 {
     CPythonGIL python_gil;
 
-    std::unique_ptr<ObjectTracer> tracer(info.GetParameter());
+    ObjectTracer *tracer = info.GetParameter();
+
+    // V8 requires the first-pass callback to Reset() its own handle (this
+    // transitions the node to FREE); Clear()/ClearWeak() are both wrong here.
+    tracer->m_handle.Reset();
+
+    delete tracer;
 }
 
 LivingMap * ObjectTracer::GetLivingMapping(void)
@@ -2914,7 +3122,15 @@ LivingMap * ObjectTracer::GetLivingMapping(void)
 
     ctxt->Global()->SetPrivate(ctxt, privateKey, v8::External::New(v8::Isolate::GetCurrent(), living.get()));
 
-    ContextTracer::Trace(ctxt, living.get());
+    ContextTracer *tracer = ContextTracer::Trace(ctxt, living.get());
+
+    RegisterContextTracer(v8::Isolate::GetCurrent(), tracer);
+
+    // Remember the tracer on the context so an owning CContext can release the
+    // wrapped Python objects deterministically when it is destroyed.
+    v8::Local<v8::String> tracerKey = v8::String::NewFromUtf8(v8::Isolate::GetCurrent(), "__ctx_tracer__").ToLocalChecked();
+    v8::Local<v8::Private> tracerPrivateKey = v8::Private::ForApi(v8::Isolate::GetCurrent(), tracerKey);
+    ctxt->Global()->SetPrivate(ctxt, tracerPrivateKey, v8::External::New(v8::Isolate::GetCurrent(), tracer));
 
     return living.release();
 }
@@ -2937,38 +3153,79 @@ v8::Handle<v8::Value> ObjectTracer::FindCache(py::object obj)
 }
 
 ContextTracer::ContextTracer(v8::Handle<v8::Context> ctxt, LivingMap *living)
-    : m_ctxt(v8::Isolate::GetCurrent(), ctxt), m_living(living)
+    : m_ctxt(v8::Isolate::GetCurrent(), ctxt), m_living(living),
+      m_isolate(v8::Isolate::GetCurrent())
 {
 }
 
 ContextTracer::~ContextTracer(void)
 {
-    v8::HandleScope handle_scope(v8::Isolate::GetCurrent());
+    UnregisterContextTracer(m_isolate, this);
 
-    v8::Handle<v8::Context> ctxt = v8::Isolate::GetCurrent()->GetCurrentContext();
-    v8::Local<v8::String> key = v8::String::NewFromUtf8(v8::Isolate::GetCurrent(), "__living__").ToLocalChecked();
-    v8::Local<v8::Private> privateKey = v8::Private::ForApi(v8::Isolate::GetCurrent(), key);
+    if (!m_living)
+        return;
 
-    Context()->Global()->DeletePrivate(ctxt, privateKey);
+    // The context is being collected, so every ObjectTracer's own weak
+    // callback is about to fire. Detach them from the map (so their
+    // destructors do not touch it) but do NOT delete them here: V8 still owns
+    // their handles and will invoke each callback exactly once, releasing the
+    // py::object it holds.
+    for (LivingMap::iterator it = m_living->begin(); it != m_living->end(); ++it)
+        it->second->DetachFromMap();
 
-    for (LivingMap::const_iterator it = m_living->begin(); it != m_living->end(); it++)
+    m_living->clear();
+}
+
+void ContextTracer::Dispose(void)
+{
+    // Manual teardown from an owning CContext destructor: the context is still
+    // alive, so Reset() is safe here and cancels this callback. Unlike the
+    // weak-callback path we own every tracer and must release them now.
+    m_ctxt.Reset();
+
+    if (!m_living)
+        return;
+
+    // Collect first: each ObjectTracer erases itself from the map when it is
+    // destroyed, which would invalidate iterators over the map.
+    std::vector<ObjectTracer *> tracers;
+    tracers.reserve(m_living->size());
+
+    for (LivingMap::iterator it = m_living->begin(); it != m_living->end(); ++it)
+        tracers.push_back(it->second);
+
+    m_living->clear();
+
+    for (size_t i = 0; i < tracers.size(); ++i)
     {
-        std::unique_ptr<ObjectTracer> tracer(it->second);
+        ObjectTracer *tracer = tracers[i];
 
-        tracer->Dispose();
+        tracer->Dispose();  // cancel its weak callback
+        delete tracer;      // releases the py::object it owns
     }
 }
 
 void ContextTracer::WeakCallback(const v8::WeakCallbackInfo<ContextTracer>& info)
 {
-    delete info.GetParameter();
+    // Destroying the tracers DECREFs the py::object instances they own, so the
+    // GIL must be held even though this runs from a V8 callback.
+    CPythonGIL python_gil;
+
+    ContextTracer *tracer = info.GetParameter();
+
+    // The first-pass callback must Reset() its own handle (see ObjectTracer).
+    tracer->m_ctxt.Reset();
+
+    delete tracer;
 }
 
-void ContextTracer::Trace(v8::Handle<v8::Context> ctxt, LivingMap *living)
+ContextTracer* ContextTracer::Trace(v8::Handle<v8::Context> ctxt, LivingMap *living)
 {
     ContextTracer *tracer = new ContextTracer(ctxt, living);
 
     tracer->Trace();
+
+    return tracer;
 }
 
 void ContextTracer::Trace(void)

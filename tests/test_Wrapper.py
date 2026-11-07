@@ -3,6 +3,7 @@
 
 import sys
 import os
+import gc
 import datetime
 import unittest
 import pytest
@@ -1064,15 +1065,47 @@ class TestWrapper(unittest.TestCase):
 
     @pytest.mark.skipif(STPYV8_DEBUG, reason="Not a test for debug mode")
     def testMemoryLeak(self):
+        def _rss_mb():
+            try:
+                with open("/proc/self/status") as fp:
+                    for line in fp:
+                        if line.startswith("VmRSS"):
+                            return int(line.split()[1]) // 1024
+            except OSError:
+                pass
+            return -1
+
+        baseline = _rss_mb()
+        if baseline < 0:
+            self.skipTest("需要 /proc/self/status 读取 RSS")
+
         with STPyV8.JSIsolate():
             with STPyV8.JSContext() as ctxt:
                 inner = ctxt.eval("i => Array(1<<20).fill(i)")
                 outer = ctxt.eval("o => o[0]")
 
+                for _ in range(10):
+                    outer(inner(1))
+
+                gc.collect()
+                STPyV8.JSIsolate.current.lowMemory()
+                baseline = _rss_mb()
+
                 for i in range(1000):
                     outer(inner(i))
 
                 self.assertEqual(999, i)
+
+                gc.collect()
+                STPyV8.JSIsolate.current.lowMemory()
+                growth = _rss_mb() - baseline
+
+        # A 1M-element array is ~8 MB; V8 may keep one such heap chunk around,
+        # so allow a generous margin while still catching unbounded growth.
+        self.assertLessEqual(
+            growth, 32,
+            "1000 次大数组分配后 RSS 增长 %d MB（上限 32 MB），存在内存泄漏"
+            % growth)
 
     def testNamedSetter(self):
         class Obj(STPyV8.JSClass):
@@ -1833,7 +1866,7 @@ class TestWrapper(unittest.TestCase):
             )
 
     def testGlobalObjectIsTheWindowClass(self):
-        # pybrowser shape: the global object IS the class with a self-referential
+        # Browser-like shape: the global object IS the class with a self-referential
         # @property `window`. With virtual descriptors there is no read-only
         # prototype accessor anymore, so `window = this` succeeds (as in Chrome)
         # and `window.window` simply follows the self-reference -- no crash, no

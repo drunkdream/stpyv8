@@ -19,6 +19,18 @@ class CJavascriptFunction;
 typedef std::shared_ptr<CJavascriptObject> CJavascriptObjectPtr;
 typedef std::shared_ptr<CJavascriptFunction> CJavascriptFunctionPtr;
 
+// Per-isolate resource registry. Templates and the Python objects handed to V8
+// as External payloads are owned here so they can be released BEFORE
+// v8::Isolate::Dispose() invalidates the isolate's global handles. A CContext
+// whose isolate is no longer registered must not call any V8 API on its
+// Persistent<Context> (the handle is already gone).
+namespace IsolateRegistry
+{
+    void Register(v8::Isolate *isolate);
+    void Forget(v8::Isolate *isolate);
+    bool IsAlive(v8::Isolate *isolate);
+}
+
 class CJavascriptObject;
 
 struct CWrapper
@@ -342,7 +354,19 @@ public:
 
     void Dispose(void);
 
+    // Forget the owning map so the destructor does not touch it. The handle is
+    // intentionally left alone: V8 requires each weak callback to Reset() its
+    // own handle, and no other code may do it on that handle's behalf.
+    void DetachFromMap(void) {
+        m_living = nullptr;
+    }
+
     static ObjectTracer& Trace(v8::Handle<v8::Value> handle, py::object *object);
+
+    // Release the ContextTracer (and every ObjectTracer) attached to `ctxt`,
+    // freeing the Python objects they own. Called from an owning CContext
+    // destructor while the context is still valid.
+    static void DisposeContext(v8::Isolate *isolate, v8::Handle<v8::Context> ctxt);
 
     static v8::Handle<v8::Value> FindCache(py::object obj);
 };
@@ -351,6 +375,9 @@ class ContextTracer
 {
     v8::Persistent<v8::Context> m_ctxt;
     std::unique_ptr<LivingMap> m_living;
+    // The isolate this tracer belongs to; used to unregister it from the
+    // per-isolate registry when it is destroyed.
+    v8::Isolate *m_isolate;
 
     void Trace(void);
 
@@ -363,7 +390,11 @@ public:
         return v8::Local<v8::Context>::New(v8::Isolate::GetCurrent(), m_ctxt);
     }
 
-    static void Trace(v8::Handle<v8::Context> ctxt, LivingMap *living);
+    // Manual teardown, invoked while the context is still alive: cancel the
+    // weak callback so it cannot fire after the tracers have been freed.
+    void Dispose(void);
+
+    static ContextTracer* Trace(v8::Handle<v8::Context> ctxt, LivingMap *living);
 };
 
 #endif

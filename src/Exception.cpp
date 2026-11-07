@@ -285,10 +285,23 @@ const std::string CJavascriptException::Extract(v8::Isolate *isolate, v8::TryCat
 
     std::ostringstream oss;
 
+    // Cap the exception text: a minified bundle can put megabytes into a single
+    // Error message (or one source line), and every throw used to allocate a
+    // string of that size -- enough to OOM the V8 heap when errors are raised in
+    // a loop. Keep enough context to locate the failure and drop the rest.
+    static const size_t kMaxMessageChars = 4096;
+
     v8::String::Utf8Value msg(isolate, try_catch.Exception());
 
     if (*msg)
-        oss << std::string(*msg, msg.length());
+    {
+        size_t n = (size_t) msg.length();
+
+        oss << std::string(*msg, n > kMaxMessageChars ? kMaxMessageChars : n);
+
+        if (n > kMaxMessageChars)
+            oss << "... (" << n << " chars)";
+    }
 
     v8::Handle<v8::Message> message = try_catch.Message();
 
@@ -328,7 +341,22 @@ const std::string CJavascriptException::Extract(v8::Isolate *isolate, v8::TryCat
         }
     }
 
-    return oss.str();
+    // Hard cap on the WHOLE string as well: the message, resource name, line
+    // numbers and source line are capped individually above, but their sum can
+    // still exceed the budget. Callers (and the tests) may rely on a bounded
+    // exception string, so enforce it once here. Leave room for the Python-side
+    // prefix (e.g. "JSError: ") that the translator prepends.
+    static const size_t kMaxTotalChars = 4000;
+
+    std::string text = oss.str();
+
+    if (text.size() > kMaxTotalChars)
+    {
+        text.resize(kMaxTotalChars - 20);
+        text += "... (truncated)";
+    }
+
+    return text;
 }
 
 static struct {

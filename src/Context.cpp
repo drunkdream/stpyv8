@@ -39,6 +39,10 @@ void CContext::Expose(void)
          "Forget the unhandled promise rejections recorded for this isolate.")
     .staticmethod("clearPendingRejections")
 
+    .def("lowMemory", &CIsolate::LowMemory,
+         "Notify the isolate that the system is low on memory, forcing a "
+         "collection now.")
+
     .def("runMicrotasks", &CIsolate::RunMicrotasks,
          "Run the microtask queue of the current isolate to completion, so a promise "
          "chain started by eval() actually progresses.")
@@ -96,7 +100,7 @@ void CContext::Expose(void)
 }
 
 CContext::CContext(v8::Isolate* isolate, v8::Handle<v8::Context> context)
-    : m_isolate(isolate)
+    : m_isolate(isolate), m_owner(false)
 {
     v8::HandleScope handle_scope(isolate);
 
@@ -104,7 +108,7 @@ CContext::CContext(v8::Isolate* isolate, v8::Handle<v8::Context> context)
 }
 
 CContext::CContext(const CContext& context)
-    : m_global(context.m_global), m_isolate(v8::Isolate::GetCurrent())
+    : m_global(context.m_global), m_isolate(v8::Isolate::GetCurrent()), m_owner(true)
 {
     v8::Isolate* isolate = m_isolate;
     v8::HandleScope handle_scope(isolate);
@@ -130,7 +134,7 @@ CContext::CContext(const CContext& context)
 }
 
 CContext::CContext(py::object global)
-    : m_global(global), m_isolate(v8::Isolate::GetCurrent())
+    : m_global(global), m_isolate(v8::Isolate::GetCurrent()), m_owner(true)
 {
     v8::Isolate* isolate = m_isolate;
     v8::HandleScope handle_scope(isolate);
@@ -150,8 +154,6 @@ CContext::CContext(py::object global)
         if(retcode.IsNothing()) {
             //TODO we need to do something if the set call failed
         }
-
-        Py_DECREF(global.ptr());
     }
 }
 

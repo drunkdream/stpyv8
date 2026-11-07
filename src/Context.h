@@ -25,6 +25,10 @@ class CContext
     // worker thread), so the owner is tracked explicitly.
     v8::Isolate* m_isolate;
     v8::Persistent<v8::Context> m_context;
+    // True only when this wrapper OWNS the V8 context (i.e. it created it).
+    // Temporary wrappers handed out by GetEntered/GetCurrent/GetCalling merely
+    // observe an existing context and must not collect or tear it down.
+    bool m_owner;
 public:
     CContext(v8::Isolate* isolate, v8::Handle<v8::Context> context);
     CContext(const CContext& context);
@@ -32,6 +36,34 @@ public:
 
     ~CContext()
     {
+        if (m_context.IsEmpty())
+            return;
+
+        v8::Isolate* isolate = m_isolate;
+
+        // A JSIsolate(True) may be disposed while a JSContext local is still
+        // alive (Python drops the with-temporary before the frame's locals).
+        // Its global handles are already gone, so only discard our local
+        // reference -- no Reset(), no other V8 API call.
+        if (!IsolateRegistry::IsAlive(isolate))
+        {
+            m_context.Clear();
+            return;
+        }
+
+        // Release the Python objects wrapped for this context while its
+        // handles are still valid, so repeated create/dispose cycles do not
+        // accumulate them. Only the owning isolate's current thread may use
+        // V8 APIs (a context can also be destroyed re-entrantly or from
+        // another thread).
+        if (m_owner && v8::Isolate::GetCurrent() == isolate)
+        {
+            v8::HandleScope handle_scope(isolate);
+
+            ObjectTracer::DisposeContext(
+                isolate, v8::Local<v8::Context>::New(isolate, m_context));
+        }
+
         m_context.Reset();
     }
 

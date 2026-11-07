@@ -79,6 +79,12 @@ public:
         m_isolate->Dispose();
     }
 
+    // Hints that the system is low on memory, making V8 collect the garbage
+    // now (and release the Python objects wrapped for dead contexts).
+    void LowMemory(void) {
+        m_isolate->LowMemoryNotification();
+    }
+
     bool IsLocked(void) {
         return v8::Locker::IsLocked(m_isolate);
     }

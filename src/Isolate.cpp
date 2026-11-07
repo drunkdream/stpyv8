@@ -195,6 +195,10 @@ void CIsolate::Init(bool owner)
     // Same reason for microtasks: run them automatically when the outermost
     // script finishes so a promise chain started by eval actually progresses.
     m_isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kAuto);
+
+    // Track everything allocated for this isolate so ~CIsolate can release it
+    // before Dispose() invalidates the isolate's global handles.
+    IsolateRegistry::Register(m_isolate);
 }
 
 py::object CIsolate::RunMicrotasks(void)
@@ -269,7 +273,14 @@ CIsolate::CIsolate(v8::Isolate *isolate) : m_isolate(isolate), m_owner(false)
 
 CIsolate::~CIsolate(void)
 {
-    if (m_owner) m_isolate->Dispose();
+    if (m_owner)
+    {
+        // V8 frees its own handles on Dispose(), but our Persistents and the
+        // Python objects behind V8 External payloads must be released first --
+        // Reset() on a handle whose isolate is gone is a use-after-free.
+        IsolateRegistry::Forget(m_isolate);
+        m_isolate->Dispose();
+    }
 }
 
 v8::Isolate *CIsolate::GetIsolate(void)
