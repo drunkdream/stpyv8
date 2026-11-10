@@ -894,9 +894,50 @@ def expected_boost_libs(cfg):
     return libs
 
 
+def ensure_boost_writable(cfg):
+    """Fail early with an actionable hint when Boost's build tree is read-only.
+
+    With ``--docker`` the build tree is bind-mounted and build.py runs as the
+    invoking uid, while an earlier container run as root may have left
+    ``bin.v2/`` / ``stage/`` owned by root. b2 then prints a flood of
+    ``mkdir: Permission denied`` and ``skipped ... for lack of ...`` lines that
+    hide the real cause. Detect any unwritable output directory before b2 runs.
+    """
+    if IS_WINDOWS or not os.path.isdir(cfg.boost_root):
+        return
+    root = os.path.abspath(cfg.boost_root)
+    uid = os.getuid() if hasattr(os, "getuid") else 1000
+    gid = os.getgid() if hasattr(os, "getgid") else 1000
+
+    def check(path):
+        if os.access(path, os.W_OK):
+            return
+        build_root = os.path.dirname(root)
+        raise BuildError(
+            "Boost build directory is not writable by uid {}: {}\n"
+            "It was probably created by a container running as root. "
+            "Fix it on the host, e.g.:\n"
+            "  sudo chown -R {}:{} {}\n"
+            "or, without sudo (chown as root inside a container):\n"
+            "  docker run --rm --entrypoint bash -v {}:/work {} "
+            "-c 'chown -R {}:{} /work'".format(
+                uid, path, uid, gid, root, build_root, DOCKER_IMAGE, uid, gid
+            )
+        )
+
+    check(root)
+    for name in ("bin.v2", "bin", "stage"):
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        for dirpath, _dirs, _files in os.walk(path):
+            check(dirpath)
+
+
 def step_boost(cfg):
     section("5/9 build Boost")
 
+    ensure_boost_writable(cfg)
     _bootstrap_boost(cfg)
     _configure_boost_python(cfg)
 
@@ -1021,6 +1062,85 @@ def clean_extension_outputs(cfg):
         removed = True
     if not removed:
         log("    nothing to clean")
+
+
+# ---------------------------------------------------------------------------
+# Stale extension detection (load test in the target environment)
+# ---------------------------------------------------------------------------
+def _extension_loads(python, path):
+    """Return ``(ok, message)`` after trying to load *path* with *python*.
+
+    Runs in a subprocess so a failed load cannot pollute (or crash) the build
+    process. ``ctypes.CDLL`` performs exactly the dynamic-linker symbol
+    resolution the interpreter does on ``import``, so a ``.so`` that needs a
+    newer glibc / libstdc++ (or has any missing symbol) fails here with e.g.
+    ``GLIBC_2.38 not found`` -- without running the module initializer (no V8
+    startup, so no ICU data is required).
+    """
+    code = (
+        "import ctypes, sys\n"
+        "try:\n"
+        "    ctypes.CDLL(sys.argv[1])\n"
+        "except BaseException as exc:\n"
+        "    sys.stderr.write('%s: %s' % (type(exc).__name__, exc))\n"
+        "    sys.exit(1)\n"
+    )
+    proc = run([python, "-c", code, path], check=False, capture=True)
+    return proc.returncode == 0, (proc.stdout or "").strip()
+
+
+def prune_incompatible_extensions(cfg):
+    """Delete in-place extensions that cannot be loaded by their interpreter.
+
+    A ``.so`` built against a newer glibc (e.g. on the host, then bind-mounted
+    into an older builder container) fails to import there with
+    ``GLIBC_2.xx not found``. ``distutils`` only rebuilds when sources change or
+    ``--force`` is given, so such a foreign ``.so`` would persist and break every
+    import -- the confusing pytest ``has valid Python names`` error is just the
+    tail of that failed ``import _STPyV8``.
+
+    Loading each existing extension with the very interpreter that will import
+    it is the ground truth for "does this binary run here"; when it does not,
+    drop it so :func:`step_extension` rebuilds it with the current toolchain.
+    Sources and the V8 / Boost trees are untouched.
+
+    If V8 itself was built on the newer glibc, rebuilding *just* the extension
+    may still embed the newer requirement -- in that case also rebuild V8 (drop
+    the ``--skip-v8-build`` flag).
+    """
+    if not IS_LINUX:
+        return
+    removed = False
+    for python in cfg.pythons:
+        path = cfg.extension_path(python)
+        if not path or not os.path.isfile(path):
+            continue
+        name = os.path.basename(path)
+        ok, message = _extension_loads(python, path)
+        if ok:
+            log("    {} loads OK".format(name))
+            continue
+        log(
+            "    removing {}: it does not load in this environment ({})".format(
+                name, (message.splitlines() or ["load failed"])[0]
+            )
+        )
+        try:
+            os.remove(path)
+            removed = True
+        except OSError as error:
+            log("    warning: could not remove {}: {}".format(path, error))
+
+    if removed:
+        # distutils keeps its own copy under build/lib*/ and `build_ext
+        # --inplace` would simply copy that stale, foreign-toolchain .so back
+        # without relinking. Drop the cache (objects included: they were built
+        # by the other toolchain too) so step_extension really recompiles and
+        # relinks the extension in this environment.
+        build_dir = os.path.join(REPO_ROOT, "build")
+        if os.path.isdir(build_dir):
+            shutil.rmtree(build_dir, ignore_errors=True)
+            log("    removed build/ so the extension is rebuilt from source")
 
 
 def step_extension(cfg, python):
@@ -1511,6 +1631,12 @@ def main(argv=None):
 
     if cfg.clean:
         clean_extension_outputs(cfg)
+
+    # Drop any in-place extension that cannot be loaded in this environment
+    # (e.g. one built on a newer glibc), otherwise importing it fails with
+    # 'GLIBC_2.xx not found'. Runs on every build (not just --clean) so a
+    # cross-environment .so is refreshed before the tests run.
+    prune_incompatible_extensions(cfg)
 
     try:
         step_preflight(cfg)

@@ -33,6 +33,7 @@ __all__ = [
     "JSStackTrace",
     "JSStackFrame",
     "JSScript",
+    "JSModule",
     "JSLocker",
     "JSUnlocker",
     "JSPlatform",
@@ -380,6 +381,7 @@ class JSEngine(_STPyV8.JSEngine):
 
 
 JSScript = _STPyV8.JSScript
+JSModule = _STPyV8.JSModule
 JSStackTrace = _STPyV8.JSStackTrace
 JSStackTrace.Options = _STPyV8.JSStackTraceOptions
 JSStackTrace.GetCurrentStackTrace = staticmethod(
@@ -412,6 +414,59 @@ class JSContext(_STPyV8.JSContext):
     def __enter__(self):
         self.enter()
         return self
+
+    def eval_module(self, source, name="", line=-1, col=-1, loader=None):
+        """Evaluate *source* as an ES module and return its namespace object.
+
+        Unlike :meth:`eval`, the code is parsed with the ECMAScript "Module"
+        goal: it gets its own scope, strict mode and ``import``/``export``
+        syntax. The returned object exposes the module's exports as attributes
+        (``ns.foo`` or ``ns["foo"]``).
+
+        *loader* resolves statically imported specifiers. Pass a dict
+        ``{specifier: source}`` or a callable ``(specifier, referrer) ->
+        source``. Relative specifiers (``./x.js``, ``../x.js``) are normalised
+        against the importing module's name first, so e.g. importing
+        ``./a.js`` from ``main.js`` looks up ``a.js``.
+
+        Dynamic ``import()`` and ``import.meta`` (``url``/``filename``/
+        ``resolve``) are supported; they use the same *loader*. A
+        microtask-only top-level ``await`` settles before the namespace is
+        returned, while awaiting real I/O still needs an event loop.
+        """
+        engine = JSEngine()
+        return engine.compileModule(source, name, line, col, loader).run()
+
+    def compile_module(self, source, name="", line=-1, col=-1, loader=None):
+        """Compile an ES module without evaluating it; returns a :class:`JSModule`.
+
+        Call ``module.run()`` for a synchronous evaluation, or
+        ``module.run_async()`` when the module awaits real I/O.
+        """
+        engine = JSEngine()
+        return engine.compileModule(source, name, line, col, loader)
+
+    def create_promise(self):
+        """Create a JS Promise plus its resolve/reject functions.
+
+        Returns ``[promise, resolve, reject]``. The functions are callable from
+        Python, which lets a host drive a top-level await backed by real I/O::
+
+            promise, resolve, _ = ctxt.create_promise()
+            ctxt.locals.ready = promise
+            module = ctxt.compile_module("export const v = await ready;", "m.js")
+            module.run_async()
+            resolve(42)
+            ctxt.run_microtasks()
+            module.namespace.v   # 42
+        """
+        return self.eval(
+            "(function () {"
+            "  var resolve, reject;"
+            "  var promise = new Promise(function (a, b) { resolve = a; reject = b; });"
+            "  return [promise, resolve, reject];"
+            "})()"
+        )
 
     # -- Promise rejection / microtask plumbing --------------------------
     #

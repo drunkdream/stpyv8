@@ -13,6 +13,7 @@
 #include "libplatform/libplatform.h"
 
 #include "Context.h"
+#include "Engine.h"
 #include "Utils.h"
 
 
@@ -155,6 +156,10 @@ void IsolateRegistry::Forget(v8::Isolate *isolate)
         delete tracer;
     }
 #endif
+
+    // Release module-graph Persistents and the Python loader while the isolate
+    // is still alive (CIsolate::~CIsolate calls Dispose() right after this).
+    CModuleRegistry::Forget(isolate);
 
     state->classTemplates.clear();
     state->objectTemplate.reset();
@@ -637,9 +642,18 @@ v8::Intercepted CPythonObject::NamedGetter(v8::Local<v8::Name> prop, const v8::P
     if (PyGen_Check(obj.ptr()))
         CALLBACK_RETURN_HANDLED(v8::Undefined(info.GetIsolate()));
 
+    // Symbol keys (and any other non-string Name) cannot be forwarded to Python
+    // by name. Answering `kYes + undefined` here used to mask the entire
+    // prototype chain -- and even the instance's own symbol properties -- so
+    // `el[Symbol.toStringTag]` was always undefined and V8's built-in
+    // Object.prototype.toString reported `[object Object]` for every JSClass
+    // instance. Step aside and let V8 resolve the key normally.
+    if (!prop->IsString())
+        CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Value>());
+
     v8::String::Utf8Value name(info.GetIsolate(), v8::Local<v8::String>::Cast(prop));
     if (*name == nullptr)
-        CALLBACK_RETURN_HANDLED(v8::Undefined(info.GetIsolate()));
+        CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Value>());
 
     // Let V8 resolve these through the real prototype chain (each wrapped class
     // now has a genuine FunctionTemplate whose .prototype carries `constructor`)
@@ -662,6 +676,22 @@ v8::Intercepted CPythonObject::NamedGetter(v8::Local<v8::Name> prop, const v8::P
     // concerned, so Python-internal state stays unreachable from scripts.
     if (CPythonObject::IsJsHiddenName(obj.ptr(), *name))
         CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Value>());
+
+    // A value the instance itself defines (its Python __dict__) must win over
+    // the class prototype. This is how the common polyfill pattern
+    // `obj.method = function () { ... }` is stored, and it has to be returned
+    // as a plain own property: that way V8 performs an ordinary method call and
+    // binds `this` to `obj`, exactly like a native object's overridden method.
+    // Returning kNo here would fall through to the prototype's PrototypeMethod
+    // stub and the override would be ignored (or lose its receiver).
+    if (PyObject **dictptr = _PyObject_GetDictPtr(obj.ptr()))
+    {
+        if (*dictptr && PyDict_Check(*dictptr))
+        {
+            if (PyObject *own = PyDict_GetItemString(*dictptr, *name))
+                CALLBACK_RETURN_HANDLED(Wrap(py::object(py::borrowed<>(own))));
+        }
+    }
 
     // A genuine property on a class prototype -- e.g. the accessor installed by
     // Object.defineProperty(Element.prototype, "scrollTop", {...}) -- outranks
@@ -739,6 +769,11 @@ v8::Intercepted CPythonObject::NamedSetter(v8::Local<v8::Name> prop, v8::Local<v
     CPythonGIL python_gil;
 
     py::object obj = CJavascriptObject::Wrap(info.Holder());
+
+    // Keep the same rule as NamedGetter: symbol writes are resolved by V8
+    // (own property / prototype accessor), never turned into Python attributes.
+    if (!prop->IsString())
+        CALLBACK_RETURN_NOT_HANDLED(v8::Undefined(info.GetIsolate()));
 
     v8::String::Utf8Value name(info.GetIsolate(), prop);
 
@@ -831,6 +866,11 @@ v8::Intercepted CPythonObject::NamedQuery(v8::Local<v8::Name> prop, const v8::Pr
     CPythonGIL python_gil;
 
     py::object obj = CJavascriptObject::Wrap(info.Holder());
+
+    // `Symbol.toStringTag in el` must be answered by the real prototype chain,
+    // not by a fabricated Python attribute lookup.
+    if (!prop->IsString())
+        CALLBACK_RETURN_NOT_HANDLED(v8::Integer::New(info.GetIsolate(), v8::None));
 
     v8::String::Utf8Value name(info.GetIsolate(), prop);
 
@@ -1376,15 +1416,22 @@ void CPythonObject::PrototypeMethod(const v8::FunctionCallbackInfo<v8::Value>& i
         CALLBACK_RETURN_NO_INTERCEPT(v8::Undefined(info.GetIsolate()));
     }
 
-    // Bind self from the resolved Python object at call time. `.attr()` may
-    // raise; the surrounding TRY_HANDLE_EXCEPTION turns that into a JS exception.
-    py::object self = receiver.attr(name.c_str());
+    // Bind the class's own Python method, NOT whatever the instance currently
+    // exposes. An instance-level override (obj.method = function(){...}) is now
+    // served by NamedGetter directly; but a reference captured before the
+    // override (`var orig = obj.method`) still points at this prototype stub.
+    // Resolving through receiver.attr() would therefore pick up the override
+    // and recurse forever. Looking the method up on the defining class keeps
+    // `orig.apply(obj, ...)` calling the original Python implementation.
+    py::object self = payload->cls.attr(name.c_str());
 
     // Forward every argument (see the matching note in Caller): the old
     // BOOST_PP_FOR((0, 10)) switch capped prototype methods at ten arguments
     // and threw "too many arguments" beyond that.
     Py_ssize_t argc = info.Length();
-    PyObject *raw_args = PyTuple_New(argc);
+    // Slot 0 is the Python receiver: `self` is an unbound function fetched from
+    // the class, so it must be called as self(receiver, *args).
+    PyObject *raw_args = PyTuple_New(argc + 1);
 
     if (!raw_args)
         throw py::error_already_set();
@@ -1393,12 +1440,15 @@ void CPythonObject::PrototypeMethod(const v8::FunctionCallbackInfo<v8::Value>& i
     // an argument still releases the tuple.
     py::object args = py::object(py::handle<>(raw_args));
 
+    Py_INCREF(receiver.ptr());
+    PyTuple_SET_ITEM(raw_args, 0, receiver.ptr());
+
     for (Py_ssize_t i = 0; i < argc; ++i)
     {
         py::object item = CJavascriptObject::Wrap(info[i]);
 
         Py_INCREF(item.ptr());
-        PyTuple_SET_ITEM(raw_args, i, item.ptr());
+        PyTuple_SET_ITEM(raw_args, i + 1, item.ptr());
     }
 
     PyObject *called = PyObject_CallObject(self.ptr(), args.ptr());
@@ -1773,6 +1823,7 @@ v8::Local<v8::FunctionTemplate> CPythonObject::GetClassTemplate(v8::Isolate *iso
     // Mirror the Python MRO into the JS prototype chain. V8 templates support
     // single inheritance, so inherit from the nearest ancestor that is a user
     // class (skip builtins such as int/str/object).
+    bool has_user_base = false;
     PyObject *mro = ::PyObject_GetAttrString(cls.ptr(), "__mro__");
     if (mro && PyTuple_Check(mro))
     {
@@ -1786,10 +1837,29 @@ v8::Local<v8::FunctionTemplate> CPythonObject::GetClassTemplate(v8::Isolate *iso
                 continue;
 
             tmpl->Inherit(GetClassTemplate(isolate, base));
+            has_user_base = true;
             break;
         }
     }
     Py_XDECREF(mro);
+
+    // Give every wrapped class its own @@toStringTag so V8's *native*
+    // Object.prototype.toString reports the WebIDL interface name, e.g.
+    // "[object HTMLDivElement]". Without it Vue 3's toRawType() sees "Object"
+    // and wraps DOM objects in reactive() Proxies; brand-checked methods then
+    // fail with "Illegal invocation".
+    //
+    // Only templates that actually Inherit may materialise a PrototypeTemplate:
+    // doing so for a root template inserts a spurious prototype level (see the
+    // note in PopulatePrototypeMethods). Each class installs its OWN name, so a
+    // subclass shadows the inherited tag instead of reusing the base class's.
+    if (has_user_base)
+    {
+        v8::Local<v8::ObjectTemplate> proto = tmpl->PrototypeTemplate();
+        proto->Set(v8::Symbol::GetToStringTag(isolate),
+                   v8::String::NewFromUtf8(isolate, cls_name.c_str()).ToLocalChecked(),
+                   static_cast<v8::PropertyAttribute>(v8::ReadOnly | v8::DontEnum));
+    }
 
     // Calling the exposed class instantiates the Python class (as before). The
     // class *function* stays callable regardless of whether its instances are.

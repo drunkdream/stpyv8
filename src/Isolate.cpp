@@ -196,6 +196,9 @@ void CIsolate::Init(bool owner)
     // script finishes so a promise chain started by eval actually progresses.
     m_isolate->SetMicrotasksPolicy(v8::MicrotasksPolicy::kAuto);
 
+    // ES-module host hooks: dynamic import() and import.meta.
+    CModuleRegistry::Install(m_isolate);
+
     // Track everything allocated for this isolate so ~CIsolate can release it
     // before Dispose() invalidates the isolate's global handles.
     IsolateRegistry::Register(m_isolate);
