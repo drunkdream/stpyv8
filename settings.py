@@ -26,6 +26,29 @@ STPYV8_VERSION = os.environ.get("STPYV8_VERSION", V8_GIT_TAG_STABLE)
 
 v8_deps_linux = os.environ.get("V8_DEPS_LINUX", "1") in ("1",)
 
+
+def _export_visual_studio_install():
+    """Expose VSINSTALLDIR to depot_tools' V8 build scripts.
+
+    msvc-dev-cmd (and vcvarsall) set the standard ``VSINSTALLDIR``, but with
+    ``DEPOT_TOOLS_WIN_TOOLCHAIN=0`` V8 only looks for lower-case
+    ``vsYYYY_install`` variables. Without this mapping, ``gn gen`` fails with
+    "No supported Visual Studio can be found" even though VS is installed.
+    """
+    if os.name != "nt":
+        return
+
+    install_dir = os.environ.get("VSINSTALLDIR", "").rstrip("\\/")
+    if not install_dir:
+        return
+
+    year = os.path.basename(os.path.dirname(install_dir))
+    if year in ("2022", "2019", "2017"):
+        os.environ.setdefault("vs{}_install".format(year), install_dir)
+
+
+_export_visual_studio_install()
+
 # Use the platform's PATH separator (':' on POSIX, ';' on Windows). A hard-coded
 # ':' makes depot_tools unreachable from Windows subprocesses.
 os.environ["PATH"] = os.pathsep.join(
