@@ -42,7 +42,7 @@ jobs:
         continue-on-error: false
         run: |
           echo "v8-hash=${{ hashFiles('v8/src/**') }}" >> "$GITHUB_OUTPUT"
-          python3 -m pip install --break-system-packages wheel
+          python3 -m pip install --break-system-packages setuptools wheel
           echo "::group::v8"
           python3 setup.py v8
           echo "::endgroup::"
