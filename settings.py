@@ -26,7 +26,11 @@ STPYV8_VERSION = os.environ.get("STPYV8_VERSION", V8_GIT_TAG_STABLE)
 
 v8_deps_linux = os.environ.get("V8_DEPS_LINUX", "1") in ("1",)
 
-os.environ["PATH"] = f"{os.environ.get('PATH', '')}:{DEPOT_HOME}"
+# Use the platform's PATH separator (':' on POSIX, ';' on Windows). A hard-coded
+# ':' makes depot_tools unreachable from Windows subprocesses.
+os.environ["PATH"] = os.pathsep.join(
+    part for part in (os.environ.get("PATH", ""), DEPOT_HOME) if part
+)
 
 ICU_DATA_FOLDER_UNIX = "/usr/share/stpyv8"
 ICU_DATA_FOLDER_OSX = "/Library/Application Support/STPyV8/"

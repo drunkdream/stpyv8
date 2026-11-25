@@ -80,6 +80,14 @@ def install_depot():
 def checkout_v8():
     install_depot()
 
+    # `fetch v8` runs from the parent of V8_HOME. In a fresh CI checkout
+    # .build/ (the new default parent) does not exist yet; subprocess.Popen
+    # then fails with WinError 267 on Windows before fetch is even started.
+    v8_parent = os.path.dirname(V8_HOME)
+
+    if v8_parent:
+        os.makedirs(v8_parent, exist_ok=True)
+
     if not os.path.exists(V8_HOME):
         success, _, __ = exec_cmd(
             os.path.join(DEPOT_HOME, "fetch"),

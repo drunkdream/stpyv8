@@ -6,6 +6,8 @@ on:
   release:
     types: [published]
     branches: [master]
+env:
+  V8_HOME: ${{ github.workspace }}/v8
 jobs:
   build-v8:
     # If Google V8 is in the workflow cache, don't build it.
@@ -14,7 +16,7 @@ jobs:
     name: Build Google V8
     runs-on: ubuntu-20.04
     outputs:
-      v8-hash: ${{ steps.build-v8.outputs.v8-hash }}
+      v8-hash: ${{ steps.v8-hash.outputs.v8-hash }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,6 +26,9 @@ jobs:
           echo "::group::Clone Google V8"
           python setup.py checkout_v8
           echo "::endgroup::"
+      - name: Compute V8 hash
+        id: v8-hash
+        run: echo "v8-hash=${{ hashFiles('v8/src/**') }}" >> "$GITHUB_OUTPUT"
       - name: Restore Google V8 from cache
         id: restore-v8
         uses: actions/cache/restore@main
@@ -38,7 +43,6 @@ jobs:
         if: ${{ steps.restore-v8.outputs.cache-hit != 'true' }}
         continue-on-error: false
         run: |
-          echo "v8-hash=${{ hashFiles('v8/src/**') }}" >> "$GITHUB_OUTPUT"
           python -m pip install setuptools wheel
           echo "::group::v8"
           python setup.py v8
