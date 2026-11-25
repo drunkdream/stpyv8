@@ -4,6 +4,54 @@
 
 #include "libplatform/libplatform.h"
 
+namespace
+{
+// Scope needed by every CContext entry point that touches V8. It re-enters the
+// context owned by this wrapper, so a Python callback invoked outside `with
+// v8.JSContext(...)` can still call ctx.eval() safely. When no Locker is held
+// (e.g. after JSContext.__exit__ released it), acquire one with the GIL
+// dropped to avoid deadlocking against another V8 thread.
+std::unique_ptr<v8::Locker> AcquireLocker(v8::Isolate *isolate)
+{
+    if (v8::Locker::IsLocked(isolate))
+        return nullptr;
+
+    std::unique_ptr<v8::Locker> locker;
+
+    Py_BEGIN_ALLOW_THREADS
+    locker.reset(new v8::Locker(isolate));
+    Py_END_ALLOW_THREADS
+
+    return locker;
+}
+
+class ContextScopeGuard
+{
+    // Declared first so it is constructed before the V8 scopes below.
+    std::unique_ptr<v8::Locker> m_locker;
+    v8::Isolate::Scope m_isolate_scope;
+    v8::HandleScope m_handle_scope;
+    v8::Context::Scope m_context_scope;
+public:
+    ContextScopeGuard(v8::Isolate *isolate,
+                      const v8::Persistent<v8::Context>& context)
+        : m_locker(AcquireLocker(isolate)),
+          m_isolate_scope(isolate),
+          m_handle_scope(isolate),
+          m_context_scope(v8::Local<v8::Context>::New(isolate, context))
+    {
+    }
+};
+
+void CheckContextAlive(v8::Isolate *isolate,
+                       const v8::Persistent<v8::Context>& context)
+{
+    if (isolate == nullptr || !IsolateRegistry::IsAlive(isolate) ||
+            context.IsEmpty())
+        throw std::runtime_error("JavaScript context is no longer alive");
+}
+}
+
 void CContext::Expose(void)
 {
     py::class_<CPlatform, boost::noncopyable>("JSPlatform", "JSPlatform allows the V8 platform to be initialized", py::no_init)
@@ -105,6 +153,7 @@ CContext::CContext(v8::Isolate* isolate, v8::Handle<v8::Context> context)
     v8::HandleScope handle_scope(isolate);
 
     m_context.Reset(isolate, context);
+    m_contextId = context->Global()->GetIdentityHash();
 }
 
 CContext::CContext(const CContext& context)
@@ -122,6 +171,7 @@ CContext::CContext(const CContext& context)
     v8::Handle<v8::Context> new_context = v8::Context::New(isolate);
 
     m_context.Reset(isolate, new_context);
+    m_contextId = new_context->Global()->GetIdentityHash();
 
     v8::Context::Scope context_scope(Handle());
 
@@ -142,6 +192,7 @@ CContext::CContext(py::object global)
     v8::Handle<v8::Context> context = v8::Context::New(isolate);
 
     m_context.Reset(isolate, context);
+    m_contextId = context->Global()->GetIdentityHash();
 
     v8::Context::Scope context_scope(Handle());
 
@@ -242,7 +293,11 @@ py::object CContext::Evaluate(const std::string& src,
                               const std::string name,
                               int line, int col)
 {
-    CEngine engine(v8::Isolate::GetCurrent());
+    CheckContextAlive(m_isolate, m_context);
+
+    ContextScopeGuard scope(m_isolate, m_context);
+
+    CEngine engine(m_isolate);
 
     CScriptPtr script = engine.Compile(src, name, line, col);
 
@@ -250,10 +305,14 @@ py::object CContext::Evaluate(const std::string& src,
 }
 
 py::object CContext::EvaluateW(const std::wstring& src,
-                               const std::wstring name,
-                               int line, int col)
+                              const std::wstring name,
+                              int line, int col)
 {
-    CEngine engine(v8::Isolate::GetCurrent());
+    CheckContextAlive(m_isolate, m_context);
+
+    ContextScopeGuard scope(m_isolate, m_context);
+
+    CEngine engine(m_isolate);
 
     CScriptPtr script = engine.CompileW(src, name, line, col);
 

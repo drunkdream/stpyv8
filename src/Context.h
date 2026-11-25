@@ -25,6 +25,9 @@ class CContext
     // worker thread), so the owner is tracked explicitly.
     v8::Isolate* m_isolate;
     v8::Persistent<v8::Context> m_context;
+    // Stable identity of the context's global object; valid without entering
+    // the isolate, used to drop coroutine bridges on destruction.
+    int m_contextId;
     // True only when this wrapper OWNS the V8 context (i.e. it created it).
     // Temporary wrappers handed out by GetEntered/GetCurrent/GetCalling merely
     // observe an existing context and must not collect or tear it down.
@@ -47,9 +50,18 @@ public:
         // reference -- no Reset(), no other V8 API call.
         if (!IsolateRegistry::IsAlive(isolate))
         {
+            if (m_owner)
+                CPythonObject::ForgetContext(isolate, m_contextId);
+
             m_context.Clear();
             return;
         }
+
+        // Invalidate this context's coroutine bridges unconditionally. Unlike
+        // DisposeContext below this makes no V8 calls, so it also works after
+        // JSContext.__exit__ has left the isolate.
+        if (m_owner)
+            CPythonObject::ForgetContext(isolate, m_contextId);
 
         // Release the Python objects wrapped for this context while its
         // handles are still valid, so repeated create/dispose cycles do not

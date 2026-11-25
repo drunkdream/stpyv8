@@ -12,6 +12,20 @@ class TestContext(unittest.TestCase):
             self.assertEqual(2, context.eval("1+1"))
             self.assertEqual("Hello world", context.eval("'Hello ' + 'world'"))
 
+    def test_eval_outside_with_does_not_crash(self):
+        """ctx.eval() must re-enter its context when called by a late callback."""
+        with STPyV8.JSContext() as ctx:
+            ctx.eval("var answer = 42;")
+
+        # __exit__ left the isolate/context; callbacks (e.g. dynamic import
+        # registration) can still hold a JSContext reference and call eval().
+        self.assertEqual(42, ctx.eval("answer"))
+        self.assertEqual(43, ctx.eval("answer + 1"))
+
+        ctx.enter()
+        self.assertEqual(44, ctx.eval("answer + 2"))
+        ctx.leave()
+
     def testMultiNamespace(self):
         self.assertTrue(not bool(STPyV8.JSContext.inContext))
         self.assertTrue(not bool(STPyV8.JSContext.entered))

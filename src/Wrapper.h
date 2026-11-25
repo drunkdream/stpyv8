@@ -59,6 +59,21 @@ public:
 
     static void Caller(const v8::FunctionCallbackInfo<v8::Value>& info);
 
+    // [[@@iterator]] for Python objects that define __iter__. Installs onto the
+    // prototype template as Symbol.iterator so `[...obj]` / `for...of` /
+    // Array.from(obj) work like they do for real browser collection objects.
+    static void IterateCallback(const v8::FunctionCallbackInfo<v8::Value>& info);
+
+    // Python awaitable (coroutine / Task / Future / any object with __await__)
+    // -> JS Promise. The asyncio loop must run on the isolate's thread: the
+    // done callback settles the resolver directly, without taking v8::Locker.
+    static v8::Local<v8::Value> CreateAwaitablePromise(py::object awaitable);
+    static void CoroSettle(unsigned long long id, bool ok, py::object value);
+    // Drop the bridges belonging to a context that is being destroyed. Makes
+    // no V8 calls, so it is safe even after JSContext.__exit__ has left the
+    // isolate (where DisposeContext cannot run).
+    static void ForgetContext(v8::Isolate *isolate, int contextId);
+
     // The class's OWN Python members are installed as REAL properties on the
     // function template's PrototypeTemplate (see PopulatePrototypeMethods):
     // @property -> native V8 AccessorPair, methods -> data property with a

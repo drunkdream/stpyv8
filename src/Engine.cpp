@@ -170,8 +170,16 @@ std::shared_ptr<CScript> CEngine::InternalCompile(v8::Handle<v8::String> src,
         int line, int col)
 {
     v8::Isolate* isolate = v8::Isolate::GetCurrent();
+
+    if (isolate == nullptr || !IsolateRegistry::IsAlive(isolate))
+        throw std::runtime_error("JavaScript isolate is no longer alive");
+
     v8::HandleScope handle_scope(isolate);
     v8::Local<v8::Context> context = isolate->GetCurrentContext();
+
+    if (context.IsEmpty())
+        throw std::runtime_error(
+            "JavaScript context is not entered; cannot compile script");
 
     v8::TryCatch try_catch(isolate);
 

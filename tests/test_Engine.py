@@ -138,9 +138,15 @@ class TestEngine(unittest.TestCase):
                 delete s[1];
             """
             )
-            self.assertEqual([2, 4], g.s)
+            # A Python list is exposed as a real (snapshot) JSArray: JS writes
+            # and deletes affect the JS copy only, never the Python list.
+            self.assertTrue(ctxt.eval("Array.isArray(s)"))
+            self.assertEqual(3, ctxt.eval("s.length"))
+            self.assertEqual(2, ctxt.eval("s[0]"))
+            self.assertEqual(4, ctxt.eval("s[2]"))
+            self.assertEqual([1, 2, 3], g.s)
             self.assertEqual("c", ctxt.eval("d.a.b"))
-            self.assertEqual(["e", "f"], ctxt.eval("d.d"))
+            self.assertEqual(["e", "f"], list(ctxt.eval("d.d")))
             ctxt.eval(
                 """
                 d.a.q = 4
@@ -149,6 +155,27 @@ class TestEngine(unittest.TestCase):
             )
             self.assertEqual(4, g.d["a"]["q"])
             self.assertEqual(None, ctxt.eval("d.d"))
+
+    def testPythonDictNoneValue(self):
+        with STPyV8.JSContext() as ctxt:
+            ctxt.locals.d = {"a": 1, "nil": None, "nums": [1, 2]}
+
+            self.assertTrue(ctxt.eval("'nil' in d"))
+            self.assertTrue(ctxt.eval("d.nil === null"))
+            self.assertEqual(
+                '{"a":1,"nil":null,"nums":[1,2]}',
+                ctxt.eval("JSON.stringify(d)"),
+            )
+
+    def testPythonDictKeyNamedLikeMethod(self):
+        with STPyV8.JSContext() as ctxt:
+            ctxt.locals.d = {"items": [1, 2], "keys": "k"}
+
+            self.assertEqual([1, 2], list(ctxt.eval("d.items")))
+            self.assertEqual("k", ctxt.eval("d.keys"))
+            self.assertEqual(
+                '{"items":[1,2],"keys":"k"}', ctxt.eval("JSON.stringify(d)")
+            )
 
     def _testMemoryAllocationCallback(self):
         alloc = {}

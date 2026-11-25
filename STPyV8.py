@@ -40,6 +40,59 @@ __all__ = [
 ]
 
 
+def _schedule_awaitable(awaitable, promise_id):
+    """Schedule a Python awaitable and settle the matching JS Promise.
+
+    Called from C++ by CPythonObject::CreateAwaitablePromise. The asyncio loop
+    must be driven on the same thread that owns the V8 isolate, so the done
+    callback can settle the resolver directly without cross-thread marshalling.
+    With no running loop the Promise is rejected immediately instead of
+    remaining pending forever.
+    """
+    import asyncio
+
+    settle = _STPyV8._coro_settle
+
+    def _discard(obj):
+        # Avoid "coroutine was never awaited" when scheduling is impossible.
+        close = getattr(obj, "close", None)
+        if callable(close):
+            close()
+        else:
+            cancel = getattr(obj, "cancel", None)
+            if callable(cancel):
+                cancel()
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError as exc:
+        _discard(awaitable)
+        settle(promise_id, False, exc)
+        return None
+
+    try:
+        task = asyncio.ensure_future(awaitable, loop=loop)
+    except Exception as exc:
+        _discard(awaitable)
+        settle(promise_id, False, exc)
+        return None
+
+    def _done(future):
+        if future.cancelled():
+            settle(promise_id, False, RuntimeError("awaitable cancelled"))
+            return
+
+        exc = future.exception()
+
+        if exc is not None:
+            settle(promise_id, False, exc)
+        else:
+            settle(promise_id, True, future.result())
+
+    task.add_done_callback(_done)
+    return task
+
+
 # ICU
 ICU_DATA_FOLDERS_UNIX = (
     "/usr/share/stpyv8",

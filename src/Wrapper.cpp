@@ -1,6 +1,7 @@
 #include "Wrapper.h"
 
 #include <stdlib.h>
+#include <cstring>
 #include <iostream>
 #include <unordered_set>
 #include <vector>
@@ -90,6 +91,124 @@ PrototypeAccessorData *OwnAccessorPayload(v8::Isolate *isolate, py::object cls,
     return raw;
 }
 
+// Returns the raw descriptor defining `name` for `cls`, scanning each class's
+// own __dict__ along the MRO (borrowed reference; the defining type keeps it
+// alive). Unlike getattr(), this preserves the *descriptor kind*: a plain
+// function is an instance method, whereas a staticmethod/classmethod wrapper is
+// a genuine class-level member -- both look like a plain function once fetched
+// from the class object.
+PyObject *FindRawClassMember(PyObject *cls, const char *name)
+{
+    PyObject *mro = ::PyObject_GetAttrString(cls, "__mro__");
+    PyObject *found = nullptr;
+
+    if (mro && PyTuple_Check(mro))
+    {
+        Py_ssize_t count = PyTuple_GET_SIZE(mro);
+
+        for (Py_ssize_t i = 0; i < count && !found; ++i)
+        {
+            PyObject *base = PyTuple_GET_ITEM(mro, i);
+
+            if (!PyType_Check(base))
+                continue;
+
+            PyObject *dict = reinterpret_cast<PyTypeObject *>(base)->tp_dict;
+
+            if (!dict || !PyDict_Check(dict))
+                continue;
+
+            PyObject *value = ::PyDict_GetItemString(dict, name);
+
+            if (value)
+                found = value;
+        }
+    }
+
+    ::Py_XDECREF(mro);
+
+    return found;
+}
+
+// --- Python awaitable -> JS Promise ----------------------------------------
+// The bridge assumes the asyncio loop is driven on the SAME thread that owns
+// the isolate; the done callback therefore settles the resolver directly and
+// never needs v8::Locker / cross-thread marshalling.
+struct CoroEntry
+{
+    v8::Isolate *isolate;
+    int contextId;             // global object identity hash, for scoped teardown
+    std::unique_ptr<v8::Persistent<v8::Promise::Resolver>> resolver;
+    std::unique_ptr<v8::Persistent<v8::Context>> context;
+    py::object awaitable;   // kept alive until settlement
+    py::object task;        // keep the scheduled Task alive as well
+};
+
+std::recursive_mutex s_coroMutex;
+std::unordered_map<unsigned long long, CoroEntry> s_coroPromises;
+unsigned long long s_nextCoroId = 1;
+
+// Every py::object* handed to V8 as an External and owned by an ObjectTracer is
+// registered here. Unwrap consults this set before dereferencing: context
+// teardown deletes the tracers while their V8 objects may still be alive, so
+// the External alone is not proof that the payload is still valid.
+std::mutex s_liveRefsMutex;
+std::unordered_set<py::object *> s_liveWrappedObjects;
+
+bool IsPythonAwaitable(PyObject *obj)
+{
+    if (obj == nullptr)
+        return false;
+
+    if (PyCoro_CheckExact(obj))
+        return true;
+
+    // Plain generators are iterables, not awaitables. Probe the *type's*
+    // am_await slot rather than getattr(obj, "__await__"): arbitrary objects
+    // (notably lazy CJavascriptArray) can implement __getattr__ with side
+    // effects, and that path must not run during a value conversion.
+    if (PyGen_Check(obj))
+        return false;
+
+    PyTypeObject *type = Py_TYPE(obj);
+
+    return type->tp_as_async != nullptr &&
+           type->tp_as_async->am_await != nullptr;
+}
+
+// Mirror CPythonObject::ThrowIf so `catch (e)` sees a real JS Error carrying
+// the Python exception message (and the exception object as a private value).
+v8::Local<v8::Value> MakeJsError(v8::Isolate *isolate, py::object exc)
+{
+    std::string msg = "Python awaitable failed";
+
+    if (!exc.is_none())
+    {
+        py::object text = py::str(exc);
+        py::extract<std::string> extractor(text);
+
+        if (extractor.check())
+            msg = extractor();
+    }
+
+    v8::Local<v8::Value> error = v8::Exception::Error(
+        v8::String::NewFromUtf8(isolate, msg.c_str(),
+                                v8::NewStringType::kNormal, msg.size())
+            .ToLocalChecked());
+
+    if (error->IsObject() && !exc.is_none())
+    {
+        v8::Local<v8::Context> ctx = isolate->GetCurrentContext();
+        v8::Local<v8::String> key =
+            v8::String::NewFromUtf8(isolate, "exc_value").ToLocalChecked();
+        error.As<v8::Object>()->SetPrivate(
+            ctx, v8::Private::ForApi(isolate, key),
+            v8::External::New(isolate, new py::object(exc)));
+    }
+
+    return error;
+}
+
 #ifdef SUPPORT_TRACE_LIFECYCLE
 void RegisterContextTracer(v8::Isolate *isolate, ContextTracer *tracer)
 {
@@ -161,6 +280,18 @@ void IsolateRegistry::Forget(v8::Isolate *isolate)
     // is still alive (CIsolate::~CIsolate calls Dispose() right after this).
     CModuleRegistry::Forget(isolate);
 
+    {
+        // Drop any unsettled coroutine bridges before the isolate is disposed.
+        std::lock_guard<std::recursive_mutex> lock(s_coroMutex);
+        std::vector<unsigned long long> ids;
+
+        for (const auto& kv : s_coroPromises)
+            if (kv.second.isolate == isolate) ids.push_back(kv.first);
+
+        for (unsigned long long id : ids)
+            s_coroPromises.erase(id);
+    }
+
     state->classTemplates.clear();
     state->objectTemplate.reset();
     state->callPayloads.clear();
@@ -191,6 +322,10 @@ std::ostream& operator <<(std::ostream& os, const CJavascriptObject& obj)
 void CWrapper::Expose(void)
 {
     PyDateTime_IMPORT;
+
+    // Internal callback used by STPyV8._schedule_awaitable when a Python
+    // coroutine/Future settles. Not part of the public API.
+    py::def("_coro_settle", &CPythonObject::CoroSettle);
 
     py::class_<CJavascriptObject, boost::noncopyable>("JSObject", py::no_init)
     .def("__getattr__", &CJavascriptObject::GetAttr)
@@ -702,6 +837,24 @@ v8::Intercepted CPythonObject::NamedGetter(v8::Local<v8::Name> prop, const v8::P
     if (HasRealPrototypeProperty(info.Holder(), prop, info.GetIsolate()))
         CALLBACK_RETURN_NOT_HANDLED(v8::Handle<v8::Value>());
 
+    // For a plain dict, a real key wins over same-named dict methods
+    // (items/keys/values/get/...). Otherwise `d.items` resolves to the bound
+    // method and a JSON payload carrying an "items" field silently loses it.
+    if (PyDict_Check(obj.ptr()))
+    {
+        PyObject *item = ::PyDict_GetItemString(obj.ptr(), *name);
+
+        if (item != nullptr)
+        {
+            Py_INCREF(item);
+            CALLBACK_RETURN_HANDLED(
+                Wrap(py::object(py::handle<>(item))));
+        }
+
+        if (::PyErr_Occurred())
+            ::PyErr_Clear();
+    }
+
     PyObject *value = ::PyObject_GetAttrString(obj.ptr(), *name);
 
     if (!value)
@@ -731,10 +884,17 @@ v8::Intercepted CPythonObject::NamedGetter(v8::Local<v8::Name> prop, const v8::P
 #endif
             if (rc == 1)
             {
-                py::object result(py::handle<>(::PyMapping_GetItemString(obj.ptr(), *name)));
+                // A present key with a None value is still present: expose it as
+                // JS null. Treating None as "absent" made `d.c === undefined`
+                // while `"c" in d` was true, and dropped the field entirely
+                // from JSON.stringify(d).
+                PyObject *value = ::PyMapping_GetItemString(obj.ptr(), *name);
 
-                if (!result.is_none())
-                    CALLBACK_RETURN_HANDLED(Wrap(result));
+                if (value != nullptr)
+                    CALLBACK_RETURN_HANDLED(
+                        Wrap(py::object(py::handle<>(value))));
+
+                ::PyErr_Clear();
             }
         }
 
@@ -1385,6 +1545,62 @@ static void ThrowIllegalInvocation(v8::Isolate *isolate)
         v8::String::NewFromUtf8Literal(isolate, "Illegal invocation")));
 }
 
+// Symbol.iterator implementation for Python objects defining __iter__. The
+// Python iterator is drained eagerly into a JS array and that array's own
+// iterator is returned. An array iterator is itself iterable and carries
+// next(), so spread, for...of and Array.from all work natively. The snapshot
+// keeps iteration independent of later Python-side mutation.
+void CPythonObject::IterateCallback(const v8::FunctionCallbackInfo<v8::Value>& info)
+{
+    v8::Isolate *isolate = info.GetIsolate();
+    v8::HandleScope handle_scope(isolate);
+
+    TRY_HANDLE_EXCEPTION_NO_INTERCEPT(v8::Undefined(isolate));
+
+    CPythonGIL python_gil;
+
+    // The receiver must be one of our wrapped Python objects; a bare
+    // `X.prototype[Symbol.iterator].call({})` is an illegal invocation.
+    if (info.This().IsEmpty() || !CPythonObject::IsWrapped(info.This()))
+    {
+        ThrowIllegalInvocation(isolate);
+        CALLBACK_RETURN_NO_INTERCEPT(v8::Undefined(isolate));
+    }
+
+    py::object receiver = CPythonObject::Unwrap(info.This());
+
+    PyObject *iter = ::PyObject_GetIter(receiver.ptr());
+
+    if (!iter)
+        throw py::error_already_set();
+
+    v8::Local<v8::Context> context = isolate->GetCurrentContext();
+    v8::Local<v8::Array> values = v8::Array::New(isolate);
+    uint32_t index = 0;
+    PyObject *item = nullptr;
+
+    while (nullptr != (item = ::PyIter_Next(iter)))
+    {
+        values->Set(context, index++, Wrap(py::object(py::handle<>(item))));
+        ::Py_DECREF(item);
+    }
+
+    ::Py_DECREF(iter);
+
+    if (::PyErr_Occurred())
+        throw py::error_already_set();
+
+    // values[Symbol.iterator]() -- a real Array Iterator with next().
+    v8::Local<v8::Value> iterator_fn =
+        values->Get(context, v8::Symbol::GetIterator(isolate)).ToLocalChecked();
+    v8::Local<v8::Value> result = iterator_fn.As<v8::Function>()
+        ->Call(context, values, 0, nullptr).ToLocalChecked();
+
+    CALLBACK_RETURN_NO_INTERCEPT(result);
+
+    END_HANDLE_EXCEPTION_NO_INTERCEPT(v8::Undefined(isolate))
+}
+
 // Call handler for a real prototype method (PopulatePrototypeMethods).
 // `self` is bound from the resolved Python receiver at call time, so both
 // `Class.prototype.method.apply(instance, args)` and a bare global function
@@ -1859,6 +2075,24 @@ v8::Local<v8::FunctionTemplate> CPythonObject::GetClassTemplate(v8::Isolate *iso
         proto->Set(v8::Symbol::GetToStringTag(isolate),
                    v8::String::NewFromUtf8(isolate, cls_name.c_str()).ToLocalChecked(),
                    static_cast<v8::PropertyAttribute>(v8::ReadOnly | v8::DontEnum));
+
+        // Map Python's __iter__ onto the real iteration protocol. Without it an
+        // object exposing __len__/__getitem__ supported obj[i] but `[...obj]`
+        // and `for...of` threw "obj is not iterable". A subclass inherits the
+        // symbol through tmpl->Inherit, so only the defining class needs it.
+        int has_iter = ::PyObject_HasAttrString(cls.ptr(), "__iter__");
+
+        if (has_iter == 1)
+        {
+            proto->Set(v8::Symbol::GetIterator(isolate),
+                       v8::FunctionTemplate::New(
+                           isolate, &CPythonObject::IterateCallback),
+                       v8::DontEnum);
+        }
+        else if (has_iter == -1)
+        {
+            ::PyErr_Clear();
+        }
     }
 
     // Calling the exposed class instantiates the Python class (as before). The
@@ -1951,6 +2185,23 @@ void CPythonObject::PopulateStaticProperties(v8::Isolate *isolate, py::object cl
         if (reserved)
             continue;
 
+        // Only genuine class-level members belong on the constructor. A plain
+        // function defined in the class body is an instance method (JS class
+        // semantics keep it on the prototype, never on the constructor), and a
+        // @property descriptor is likewise instance-only. Exposing them here
+        // leaked every method as an unbound function -- `K.foo()` then failed
+        // with "missing 1 required positional argument: 'self'", and the
+        // inherited JSClass.toString shadowed Function.prototype.toString.
+        //
+        // The descriptor is inspected on the class that actually defines it
+        // (MRO order), because getattr() erases staticmethod/classmethod into a
+        // plain function and would make them indistinguishable from methods.
+        PyObject *raw = FindRawClassMember(cls.ptr(), cname);
+
+        if (!raw || PyFunction_Check(raw) ||
+                PyObject_TypeCheck(raw, &PyProperty_Type))
+            continue;
+
         if (!::PyObject_HasAttrString(cls.ptr(), cname))
             continue;
 
@@ -1972,9 +2223,24 @@ py::object CPythonObject::Unwrap(v8::Handle<v8::Object> obj)
     v8::Isolate* isolate = v8::Isolate::GetCurrent();
     v8::HandleScope handle_scope(isolate);
 
-    v8::Handle<v8::External> payload = v8::Handle<v8::External>::Cast(obj->GetInternalField(0));
+    v8::Local<v8::External> field =
+        v8::Local<v8::External>::Cast(obj->GetInternalField(0));
 
-    return *static_cast<py::object *>(payload->Value());
+    py::object *payload = static_cast<py::object *>(field->Value());
+
+    // The External outlives its payload after context teardown deletes the
+    // ObjectTracers. Never dereference an unregistered pointer.
+#ifdef SUPPORT_TRACE_LIFECYCLE
+    {
+        std::lock_guard<std::mutex> lock(s_liveRefsMutex);
+
+        if (s_liveWrappedObjects.find(payload) == s_liveWrappedObjects.end())
+            throw CJavascriptException("stale Python object reference",
+                                       ::PyExc_ReferenceError);
+    }
+#endif
+
+    return *payload;
 }
 
 void CPythonObject::Dispose(v8::Handle<v8::Value> value)
@@ -1998,6 +2264,112 @@ void CPythonObject::Dispose(v8::Handle<v8::Value> value)
             Py_DECREF(CPythonObject::Unwrap(obj).ptr());
         }
     }
+}
+
+// Create the JS Promise first, then hand the awaitable to the asyncio helper in
+// STPyV8.py. The helper either schedules it (and calls CoroSettle later) or
+// settles with an immediate error when there is no running loop.
+v8::Local<v8::Value> CPythonObject::CreateAwaitablePromise(py::object awaitable)
+{
+    v8::Isolate *isolate = v8::Isolate::GetCurrent();
+    v8::Local<v8::Context> context = isolate->GetCurrentContext();
+
+    v8::Local<v8::Promise::Resolver> resolver =
+        v8::Promise::Resolver::New(context).ToLocalChecked();
+    v8::Local<v8::Promise> promise = resolver->GetPromise();
+
+    unsigned long long id;
+    {
+        std::lock_guard<std::recursive_mutex> lock(s_coroMutex);
+        id = s_nextCoroId++;
+
+        CoroEntry entry;
+        entry.isolate = isolate;
+        entry.contextId = context->Global()->GetIdentityHash();
+        entry.resolver = std::make_unique<
+            v8::Persistent<v8::Promise::Resolver>>(isolate, resolver);
+        entry.context =
+            std::make_unique<v8::Persistent<v8::Context>>(isolate, context);
+        entry.awaitable = awaitable;
+        s_coroPromises.emplace(id, std::move(entry));
+    }
+
+    py::object task;
+    try
+    {
+        task = py::import("STPyV8").attr("_schedule_awaitable")(awaitable, id);
+    }
+    catch (const py::error_already_set&)
+    {
+        PyObject *exc = nullptr, *val = nullptr, *tb = nullptr;
+        ::PyErr_Fetch(&exc, &val, &tb);
+        ::PyErr_NormalizeException(&exc, &val, &tb);
+        py::object error = val ? py::object(py::handle<>(val)) : py::object();
+        ::Py_XDECREF(exc);
+        ::Py_XDECREF(tb);
+        CoroSettle(id, false, error);
+        return promise;
+    }
+
+    if (!task.is_none())
+    {
+        std::lock_guard<std::recursive_mutex> lock(s_coroMutex);
+        auto it = s_coroPromises.find(id);
+        if (it != s_coroPromises.end())
+            it->second.task = task;
+    }
+
+    return promise;
+}
+
+void CPythonObject::ForgetContext(v8::Isolate *isolate, int contextId)
+{
+    std::lock_guard<std::recursive_mutex> lock(s_coroMutex);
+    std::vector<unsigned long long> ids;
+
+    for (const auto& kv : s_coroPromises)
+        if (kv.second.isolate == isolate && kv.second.contextId == contextId)
+            ids.push_back(kv.first);
+
+    for (unsigned long long id : ids)
+        s_coroPromises.erase(id);
+}
+
+// Called from the asyncio done callback on the isolate's own thread. Runs with
+// the GIL held (Boost.Python call), then enters the isolate/context explicitly
+// because the callback fires outside any JS execution.
+void CPythonObject::CoroSettle(unsigned long long id, bool ok, py::object value)
+{
+    CPythonGIL python_gil;
+
+    CoroEntry entry;
+    {
+        std::lock_guard<std::recursive_mutex> lock(s_coroMutex);
+        auto it = s_coroPromises.find(id);
+        if (it == s_coroPromises.end())
+            return;
+
+        entry = std::move(it->second);
+        s_coroPromises.erase(it);
+    }
+
+    v8::Isolate *isolate = entry.isolate;
+    v8::Isolate::Scope isolate_scope(isolate);
+    v8::HandleScope handle_scope(isolate);
+    v8::Local<v8::Context> ctx =
+        v8::Local<v8::Context>::New(isolate, *entry.context);
+    v8::Context::Scope context_scope(ctx);
+
+    v8::Local<v8::Value> payload =
+        ok ? Wrap(value) : MakeJsError(isolate, value);
+
+    v8::Local<v8::Promise::Resolver> resolver =
+        v8::Local<v8::Promise::Resolver>::New(isolate, *entry.resolver);
+
+    if (ok)
+        resolver->Resolve(ctx, payload).FromMaybe(false);
+    else
+        resolver->Reject(ctx, payload).FromMaybe(false);
 }
 
 v8::Handle<v8::Value> CPythonObject::Wrap(py::object obj)
@@ -2026,6 +2398,12 @@ v8::Handle<v8::Value> CPythonObject::WrapInternal(py::object obj)
     if (obj.is_none()) return v8::Null(isolate);
     if (obj.ptr() == Py_True) return v8::True(isolate);
     if (obj.ptr() == Py_False) return v8::False(isolate);
+
+    // An awaitable becomes a JS Promise. The asyncio loop must be driven on
+    // this same thread; otherwise the helper settles with an error instead of
+    // leaving a Promise pending forever.
+    if (IsPythonAwaitable(obj.ptr()))
+        return handle_scope.Escape(CreateAwaitablePromise(obj));
 
     py::extract<CJavascriptObject&> extractor(obj);
 
@@ -2088,7 +2466,23 @@ v8::Handle<v8::Value> CPythonObject::WrapInternal(py::object obj)
     {
         result = v8::Boolean::New(isolate, py::extract<bool>(obj));
     }
-    else if (PyBytes_CheckExact(obj.ptr()) || PyUnicode_CheckExact(obj.ptr()))
+    else if (PyBytes_CheckExact(obj.ptr()))
+    {
+        // bytes is an arbitrary byte sequence, not text: expose it as a
+        // Uint8Array over a fresh ArrayBuffer. Copy the data because V8 must
+        // own the backing store; handing it Python memory would be unsafe.
+        // (str -> JS string remains the branch below.)
+        size_t size = static_cast<size_t>(PyBytes_GET_SIZE(obj.ptr()));
+        v8::Local<v8::ArrayBuffer> buffer =
+            v8::ArrayBuffer::New(isolate, size);
+
+        if (size > 0)
+            ::memcpy(buffer->GetBackingStore()->Data(),
+                     PyBytes_AS_STRING(obj.ptr()), size);
+
+        result = v8::Uint8Array::New(buffer, 0, size);
+    }
+    else if (PyUnicode_CheckExact(obj.ptr()))
     {
         result = ToString(obj);
     }
@@ -2155,6 +2549,44 @@ v8::Handle<v8::Value> CPythonObject::WrapInternal(py::object obj)
 
 #ifdef SUPPORT_TRACE_LIFECYCLE
         if (!result.IsEmpty()) ObjectTracer::Trace(result, object);
+#endif
+    }
+    else if (PyList_CheckExact(obj.ptr()) || PyTuple_CheckExact(obj.ptr()))
+    {
+        // A Python list/tuple becomes a real JSArray. Without this branch they
+        // fell into the generic object branch below and surfaced as JSClass-like
+        // objects: Array.isArray() was false and .length / .includes and the
+        // native array methods were missing. This is a snapshot copy -- mutations
+        // on the JS side do not write back to Python, which is the right
+        // semantics for read-only values such as DOM collections.
+        //
+        // Only exact list/tuple are converted. A subclass (in particular a
+        // `class X(list, JSClass)` hybrid) must keep going through the instance
+        // interceptor, like the scalar CheckExact branches above.
+        v8::Local<v8::Context> context = isolate->GetCurrentContext();
+        bool is_list = PyList_CheckExact(obj.ptr());
+        Py_ssize_t size = is_list
+            ? PyList_GET_SIZE(obj.ptr())
+            : PyTuple_GET_SIZE(obj.ptr());
+        v8::Local<v8::Array> array =
+            v8::Array::New(isolate, static_cast<int>(size));
+
+        for (Py_ssize_t i = 0; i < size; ++i)
+        {
+            PyObject *item = is_list
+                ? PyList_GET_ITEM(obj.ptr(), i)
+                : PyTuple_GET_ITEM(obj.ptr(), i);
+
+            array->Set(context, static_cast<uint32_t>(i),
+                       Wrap(py::object(py::handle<>(py::borrowed<>(item)))));
+        }
+
+        result = array;
+
+#ifdef SUPPORT_TRACE_LIFECYCLE
+        // Keep a stable JS identity for the same Python list, so repeated reads
+        // of e.g. `obj.items` hand back the same JSArray within one session.
+        if (!result.IsEmpty()) ObjectTracer::Trace(result, new py::object(obj));
 #endif
     }
     else
@@ -3084,6 +3516,11 @@ ObjectTracer::~ObjectTracer()
     // from ContextTracer's teardown (which clears the map first).
     if (m_living && m_object)
         m_living->erase(m_object->ptr());
+
+    {
+        std::lock_guard<std::mutex> lock(s_liveRefsMutex);
+        s_liveWrappedObjects.erase(m_object.get());
+    }
 }
 
 void ObjectTracer::Dispose(void)
@@ -3101,6 +3538,24 @@ void ObjectTracer::DisposeContext(v8::Isolate *isolate, v8::Handle<v8::Context> 
     CPythonGIL python_gil;
 
     v8::HandleScope handle_scope(isolate);
+
+    // Drop this context's coroutine bridges BEFORE releasing the ObjectTracers.
+    // Otherwise a Task completing after teardown could still call _coro_settle,
+    // resolve a Promise into a torn-down context, and let a JS continuation
+    // touch a wrapper whose py::object* was just freed (SIGSEGV in Unwrap).
+    {
+        std::lock_guard<std::recursive_mutex> lock(s_coroMutex);
+        std::vector<unsigned long long> ids;
+
+        int contextId = ctxt->Global()->GetIdentityHash();
+
+        for (const auto& kv : s_coroPromises)
+            if (kv.second.isolate == isolate && kv.second.contextId == contextId)
+                ids.push_back(kv.first);
+
+        for (unsigned long long id : ids)
+            s_coroPromises.erase(id);
+    }
 
     v8::Local<v8::Object> global = ctxt->Global();
 
@@ -3149,6 +3604,11 @@ void ObjectTracer::Trace(void)
     m_handle.SetWeak(this, WeakCallback, v8::WeakCallbackType::kParameter);
 
     m_living->insert(std::make_pair(m_object->ptr(), this));
+
+    {
+        std::lock_guard<std::mutex> lock(s_liveRefsMutex);
+        s_liveWrappedObjects.insert(m_object.get());
+    }
 }
 
 

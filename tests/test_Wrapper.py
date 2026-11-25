@@ -1968,3 +1968,39 @@ class TestWrapper(unittest.TestCase):
                 ctxt.eval("delete o['\\uD800']")
             except ReferenceError:
                 pass
+
+    def testBytesBecomesUint8Array(self):
+        data = b"\x00\xffA"
+
+        with STPyV8.JSContext() as ctxt:
+            ctxt.locals.data = data
+
+            self.assertTrue(ctxt.eval("data instanceof Uint8Array"))
+            self.assertTrue(ctxt.eval("data.buffer instanceof ArrayBuffer"))
+            self.assertEqual(3, ctxt.eval("data.length"))
+            self.assertEqual(0, ctxt.eval("data[0]"))
+            self.assertEqual(255, ctxt.eval("data[1]"))
+            self.assertEqual(65, ctxt.eval("data[2]"))
+
+            # The Uint8Array owns a copy: JS writes do not mutate Python bytes.
+            ctxt.eval("data[0] = 9")
+            self.assertEqual(9, ctxt.eval("data[0]"))
+            self.assertEqual(b"\x00\xffA", data)
+
+            ctxt.locals.empty = b""
+            self.assertEqual(0, ctxt.eval("empty.length"))
+
+            ctxt.locals.text = "\u4f60\u597d"
+            self.assertEqual("string", ctxt.eval("typeof text"))
+            self.assertEqual("\u4f60\u597d", ctxt.eval("text"))
+
+    def testBytesReturnValueBecomesUint8Array(self):
+        def get_bytes():
+            return b"\x01\x02"
+
+        with STPyV8.JSContext() as ctxt:
+            ctxt.locals.get_bytes = get_bytes
+
+            self.assertTrue(ctxt.eval("get_bytes() instanceof Uint8Array"))
+            self.assertEqual(2, ctxt.eval("get_bytes().length"))
+            self.assertEqual(1, ctxt.eval("get_bytes()[0]"))
