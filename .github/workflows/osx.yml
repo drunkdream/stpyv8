@@ -70,8 +70,6 @@ jobs:
       matrix:
         os: [macos-13]
         python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
-        boost-version: [1.87.0]
-        boost-version-snake: ['1_87_0']
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -79,16 +77,22 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Resolve Boost version from settings.py
+        id: boost_version
+        shell: bash
+        run: |
+          echo "version=$(python -c 'import settings; print(settings.BOOST_VERSION)')" >> "$GITHUB_OUTPUT"
+          echo "snake=$(python -c 'import settings; print(settings.BOOST_VERSION_SNAKE)')" >> "$GITHUB_OUTPUT"
       - name: Download Boost
         id: download-boost
         uses: suisei-cn/actions-download-file@v1.6.0
         with:
-          url: https://archives.boost.io/release/${{ matrix.boost-version }}/source/boost_${{matrix.boost-version-snake }}.zip
+          url: https://archives.boost.io/release/${{ steps.boost_version.outputs.version }}/source/boost_${{ steps.boost_version.outputs.snake }}.zip
       - name: Install Boost
         id: install-boost
         run: |
           unzip -q ${{ steps.download-boost.outputs.filename }}
-          cd boost_${{ matrix.boost-version-snake }}
+          cd boost_${{ steps.boost_version.outputs.snake }}
           ./bootstrap.sh
           sudo ./b2 install -j 8 --with-system --with-python --with-filesystem --with-iostreams --with-date_time --with-thread
       - name: Restore Google V8 from cache

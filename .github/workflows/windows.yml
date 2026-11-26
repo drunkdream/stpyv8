@@ -20,7 +20,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        # Needed for MSVC toolset 14.2
         os: [windows-latest]
     outputs:
       v8-hash: ${{ steps.v8-hash.outputs.v8-hash }}
@@ -45,7 +44,7 @@ jobs:
             v8\out.gn\x64.release.sample\obj\v8_monolith.lib
             v8\out.gn\x64.release.sample\icudtl.dat
             v8\include
-          key: windows-build-v8-${{ hashFiles('v8/src/**') }}
+          key: windows-build-v8-${{ matrix.os }}-${{ hashFiles('v8/src/**') }}
       - name: Initialize MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         if: ${{ steps.restore-v8.outputs.cache-hit != 'true' }}
@@ -89,7 +88,7 @@ jobs:
             v8\out.gn\x64.release.sample\obj\v8_monolith.lib
             v8\out.gn\x64.release.sample\icudtl.dat
             v8\include
-          key: windows-build-v8-${{ hashFiles('v8/src/**') }}
+          key: windows-build-v8-${{ matrix.os }}-${{ hashFiles('v8/src/**') }}
   build:
     name: Build Windows wheel (Python ${{ matrix.python-version }})
     needs: build-v8
@@ -98,11 +97,8 @@ jobs:
       DIST_NAME: stpyv8-windows-py${{ matrix.python-version }}
     strategy:
       matrix:
-        # Needed for MSVC toolset 14.2
-        os: [windows-2019]
+        os: [windows-latest]
         python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
-        boost-version: [1.84.0]
-        boost-version-snake: ['1_84_0']
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -111,12 +107,18 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Resolve Boost version from settings.py
+        id: boost_version
+        shell: bash
+        run: |
+          echo "version=$(python -c 'import settings; print(settings.BOOST_VERSION)')" >> "$GITHUB_OUTPUT"
+          echo "snake=$(python -c 'import settings; print(settings.BOOST_VERSION_SNAKE)')" >> "$GITHUB_OUTPUT"
       - name: Restore Boost from cache
         id: restore-boost
         uses: actions/cache/restore@main
         with:
           path: ${{ env.BOOST_ROOT }}\stage\lib
-          key: boost-${{ matrix.boost-version }}-python${{ matrix.python-version }}-vc142
+          key: boost-${{ matrix.os }}-${{ steps.boost_version.outputs.version }}-python${{ matrix.python-version }}-vc142
       - name: Initialize MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         if: ${{ steps.restore-boost.outputs.cache-hit != 'true' }}
@@ -127,7 +129,7 @@ jobs:
         id: download-boost
         uses: suisei-cn/actions-download-file@v1.6.0
         with:
-          url: https://archives.boost.io/release/${{ matrix.boost-version }}/source/boost_${{matrix.boost-version-snake }}.zip
+          url: https://archives.boost.io/release/${{ steps.boost_version.outputs.version }}/source/boost_${{ steps.boost_version.outputs.snake }}.zip
       - name: Install Boost
         if: ${{ steps.restore-boost.outputs.cache-hit != 'true' }}
         id: install-boost
@@ -159,7 +161,7 @@ jobs:
         if: ${{ steps.restore-boost.outputs.cache-hit != 'true' }}
         with:
           path: ${{ steps.install-boost.outputs.BOOST_ROOT }}\stage\lib
-          key: boost-${{ matrix.boost-version }}-python${{ matrix.python-version }}-vc142
+          key: boost-${{ matrix.os }}-${{ steps.boost_version.outputs.version }}-python${{ matrix.python-version }}-vc142
       - name: Restore Google V8 from cache
         id: restore-v8
         uses: actions/cache/restore@main
@@ -168,7 +170,7 @@ jobs:
             v8\out.gn\x64.release.sample\obj\v8_monolith.lib
             v8\out.gn\x64.release.sample\icudtl.dat
             v8\include
-          key: windows-build-v8-${{ needs.build-v8.outputs.v8-hash }}
+          key: windows-build-v8-${{ matrix.os }}-${{ needs.build-v8.outputs.v8-hash }}
       - name: Build wheel
         env:
           # Set include and library files which will be picked up by setuptools

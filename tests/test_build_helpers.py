@@ -21,6 +21,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 import build  # noqa: E402  (path set up above)
+import settings  # noqa: E402  (path set up above)
 
 
 class TestV8OnlyBuild(unittest.TestCase):
@@ -188,6 +189,33 @@ class TestEnsureBoostWritable(unittest.TestCase):
             build.os, "access", side_effect=AssertionError("should not check")
         ):
             build.ensure_boost_writable(self.cfg)
+
+
+class TestBoostVersionSingleSource(unittest.TestCase):
+    def test_settings_exposes_archive_versions(self):
+        self.assertTrue(settings.BOOST_GIT_TAG.startswith("boost-"))
+        self.assertEqual(
+            settings.BOOST_GIT_TAG[len("boost-") :], settings.BOOST_VERSION
+        )
+        self.assertEqual(
+            settings.BOOST_VERSION.replace(".", "_"), settings.BOOST_VERSION_SNAKE
+        )
+
+    def test_workflows_read_boost_version_from_settings(self):
+        workflows = []
+        for path in sorted((Path(ROOT) / ".github" / "workflows").glob("*.yml")):
+            text = path.read_text(encoding="utf-8")
+
+            self.assertNotIn("boost-version:", text, str(path))
+            self.assertNotIn("boost-version-snake:", text, str(path))
+
+            if "Download Boost" in text:
+                workflows.append(path)
+                self.assertIn("settings.BOOST_VERSION", text, str(path))
+                self.assertIn("steps.boost_version.outputs.version", text, str(path))
+                self.assertIn("steps.boost_version.outputs.snake", text, str(path))
+
+        self.assertEqual(4, len(workflows))
 
 
 if __name__ == "__main__":

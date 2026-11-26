@@ -19,6 +19,14 @@ BOOST_GIT_URL = "https://github.com/boostorg/boost.git"
 # If a newer CPython fails to build its boost_pythonXY, bump this to the latest
 # Boost tag.
 BOOST_GIT_TAG = "boost-1.89.0"
+# Archive/cache helpers derived from the single pin above, so CI workflows can
+# stay in sync with the source the local build uses.
+BOOST_VERSION = (
+    BOOST_GIT_TAG[len("boost-") :]
+    if BOOST_GIT_TAG.startswith("boost-")
+    else BOOST_GIT_TAG
+)
+BOOST_VERSION_SNAKE = BOOST_VERSION.replace(".", "_")
 
 # Allow the wheel version to be overridden (e.g. a local patch suffix such as
 # "13.1.201.22.post1") without changing the V8 tag that gets checked out/built.
