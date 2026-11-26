@@ -118,7 +118,7 @@ jobs:
         uses: actions/cache/restore@main
         with:
           path: ${{ env.BOOST_ROOT }}\stage\lib
-          key: boost-${{ matrix.os }}-${{ steps.boost_version.outputs.version }}-python${{ matrix.python-version }}-vc142-layout-system
+          key: boost-${{ matrix.os }}-${{ steps.boost_version.outputs.version }}-python${{ matrix.python-version }}-vc142-x64-system
       - name: Initialize MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         if: ${{ steps.restore-boost.outputs.cache-hit != 'true' }}
@@ -161,22 +161,22 @@ jobs:
           # Patch bug affecting compilation on Python 3.10
           # https://github.com/boostorg/python/commit/cbd2d9f033c61d29d0a1df14951f4ec91e7d05cd
           (Get-Content libs\python\src\exec.cpp).replace('_Py_fopen', 'fopen') | Set-Content libs\python\src\exec.cpp
-          # settings.py links against system-layout names (boost_python312.lib,
-          # libboost_iostreams.lib, libboost_filesystem.lib). Without
-          # --layout=system b2 emits versioned names such as
-          # boost_python312-vc142-mt-s-x64-1_89.lib and the extension cannot
-          # find them.
-          .\b2.exe stage -j 8 toolset=msvc-14.2 link=static runtime-link=static --layout=system --with-python --with-filesystem --with-iostreams --with-date_time --with-thread
+          # settings.py links system-layout names. Build the same variant the
+          # extension uses: 64-bit, release, static Boost and static CRT.
+          # Without address-model=64 b2 can emit 32-bit libraries, whose decorated
+          # C++ symbols do not match the x64 extension and cause mass LNK2001s.
+          .\b2.exe stage -j 8 toolset=msvc-14.2 link=static runtime-link=static variant=release address-model=64 --layout=system --with-python --with-filesystem --with-iostreams --with-date_time --with-thread
           if ($LASTEXITCODE -ne 0) { throw "Boost build failed with exit code $LASTEXITCODE" }
 
-          # Boost.Python may still emit libboost_pythonXY.lib under the system
-          # layout. Normalize it to the unprefixed name used by settings.py.
+          # Static libraries use the `lib` prefix on Windows; settings.py wants
+          # the unprefixed Boost.Python name. Overwrite any same-named import lib.
           $pyTag = '${{ matrix.python-version }}' -replace '\.', ''
           $boostPython = "boost_python$pyTag.lib"
           $prefixedPython = "lib$boostPython"
-          if (-not (Test-Path "stage\lib\$boostPython") -and (Test-Path "stage\lib\$prefixedPython")) {
-            Copy-Item "stage\lib\$prefixedPython" "stage\lib\$boostPython"
+          if (-not (Test-Path "stage\lib\$prefixedPython")) {
+            throw "Static Boost.Python library missing: $prefixedPython"
           }
+          Copy-Item "stage\lib\$prefixedPython" "stage\lib\$boostPython" -Force
 
           foreach ($lib in @($boostPython, 'libboost_iostreams.lib', 'libboost_filesystem.lib')) {
             if (-not (Test-Path "stage\lib\$lib")) {
@@ -189,7 +189,7 @@ jobs:
         if: ${{ steps.restore-boost.outputs.cache-hit != 'true' }}
         with:
           path: ${{ steps.install-boost.outputs.BOOST_ROOT }}\stage\lib
-          key: boost-${{ matrix.os }}-${{ steps.boost_version.outputs.version }}-python${{ matrix.python-version }}-vc142-layout-system
+          key: boost-${{ matrix.os }}-${{ steps.boost_version.outputs.version }}-python${{ matrix.python-version }}-vc142-x64-system
       - name: Restore Google V8 from cache
         id: restore-v8
         uses: actions/cache/restore@main

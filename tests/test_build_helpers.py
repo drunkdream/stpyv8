@@ -223,7 +223,9 @@ class TestBoostVersionSingleSource(unittest.TestCase):
         # versioned layout produces names like boost_pythonXY-vc142-mt-s-...
         # and makes the extension link fail with LNK1181.
         self.assertIn("--layout=system", text)
-        self.assertIn("vc142-layout-system", text)
+        self.assertIn("address-model=64", text)
+        self.assertIn("variant=release", text)
+        self.assertIn("vc142-x64-system", text)
         self.assertIn("libboost_iostreams.lib", text)
         self.assertIn("libboost_filesystem.lib", text)
 
