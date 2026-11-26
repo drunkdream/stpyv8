@@ -159,6 +159,34 @@ def default_vs_install():
     ) + r"\Microsoft Visual Studio\2022\BuildTools"
 
 
+def detect_windows_sdk_version():
+    """Return the newest installed Windows 10 SDK folder, if any.
+
+    V8 pins an SDK revision that is often older than the one on the runner (and
+    its dcomp.h check rejects the pinned 10.0.22621.0 unless a servicing update
+    happened to be installed). Prefer the newest installed revision so the
+    toolchain patch in step_toolchain() points at headers that really exist.
+    """
+    program_files_x86 = os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)"
+    include_root = os.path.join(program_files_x86, "Windows Kits", "10", "Include")
+
+    if not os.path.isdir(include_root):
+        return None
+
+    versions = []
+
+    for name in os.listdir(include_root):
+        parts = name.split(".")
+
+        if len(parts) == 4 and all(part.isdigit() for part in parts):
+            versions.append(tuple(int(part) for part in parts))
+
+    if not versions:
+        return None
+
+    return ".".join(str(part) for part in max(versions))
+
+
 def _is_v8_checkout(path):
     """Return True when *path* looks like a V8 source checkout."""
     if not os.path.isdir(path):
@@ -204,7 +232,13 @@ class Config:
         self.fetch_v8 = args.fetch_v8
         self.run_build_deps = args.run_build_deps
         self.no_sysroot = args.no_sysroot
-        self.windows_sdk_version = args.windows_sdk_version
+        self.windows_sdk_version = (
+            args.windows_sdk_version
+            or os.environ.get("STPYV8_WINDOWS_SDK_VERSION")
+            or detect_windows_sdk_version()
+            or "10.0.26100.0"
+        )
+        self.v8_only = getattr(args, "v8_only", False)
         self.vs_install = args.vs_install or default_vs_install()
         self.version = args.version
         self.debug = args.debug
@@ -579,7 +613,11 @@ def step_preflight(cfg):
         ensure_python_dev(cfg, python)
 
     ensure_depot_tools(cfg)
-    ensure_boost(cfg)
+
+    if cfg.v8_only:
+        log("    v8-only: skipping Python headers and Boost checks")
+    else:
+        ensure_boost(cfg)
 
     if IS_WINDOWS:
         if not os.path.isdir(os.path.join(cfg.vs_install, "VC", "Tools", "MSVC")):
@@ -606,8 +644,10 @@ def step_preflight(cfg):
                     )
                 )
 
-    for python in cfg.pythons:
-        ensure_python_deps(python)
+    if not cfg.v8_only:
+        for python in cfg.pythons:
+            ensure_python_deps(python)
+
     log("    toolchain OK")
 
 
@@ -1268,7 +1308,11 @@ def parse_args(argv=None):
     )
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 4, help="parallel build jobs")
     parser.add_argument("--gn-args", help="override the GN args taken from settings.py")
-    parser.add_argument("--windows-sdk-version", default="10.0.26100.0", help="[Windows] installed SDK revision")
+    parser.add_argument(
+        "--windows-sdk-version",
+        default=None,
+        help="[Windows] installed SDK revision (default: newest detected, else 10.0.26100.0)",
+    )
     parser.add_argument("--vs-install", help="[Windows] Visual Studio / Build Tools install path")
     parser.add_argument("--debug", action="store_true", help="emit an extension PDB (_STPyV8.pdb) for crash symbolization; V8 stays in release mode (STPYV8_PDB)")
     parser.add_argument("--fetch-v8", action="store_true", help="run 'fetch --no-history v8' when no checkout exists")
@@ -1285,6 +1329,11 @@ def parse_args(argv=None):
     parser.add_argument("--skip-v8-build", action="store_true", help="skip gn gen / ninja")
     parser.add_argument("--skip-boost", action="store_true", help="skip the Boost build")
     parser.add_argument("--skip-tests", action="store_true", help="skip the pytest suite")
+    parser.add_argument(
+        "--v8-only",
+        action="store_true",
+        help="check out/sync/build V8 only; skip Boost, extension, tests and wheel",
+    )
     parser.add_argument(
         "--wheel",
         action="store_true",
@@ -1650,9 +1699,9 @@ def main(argv=None):
 
         step_toolchain(cfg)
 
-        if args.skip_boost:
+        if args.skip_boost or cfg.v8_only:
             section("5/9 build Boost")
-            log("    skipped (--skip-boost)")
+            log("    skipped (--skip-boost/--v8-only)")
         else:
             step_boost(cfg)
 
@@ -1662,23 +1711,31 @@ def main(argv=None):
         else:
             step_v8(cfg)
 
-        # V8 and the ICU data are Python-agnostic: everything below runs once
-        # per configured interpreter.
-        step_icu(cfg)
-
-        for python in cfg.pythons:
-            step_extension(cfg, python)
-
-        if args.skip_tests:
+        if cfg.v8_only:
+            section("7/9 install ICU data")
+            log("    skipped (--v8-only)")
+            section("8/9 build extension")
+            log("    skipped (--v8-only)")
             section("9/9 run tests")
-            log("    skipped (--skip-tests)")
+            log("    skipped (--v8-only)")
         else:
-            for python in cfg.pythons:
-                step_tests(cfg, python)
+            # V8 and the ICU data are Python-agnostic: everything below runs once
+            # per configured interpreter.
+            step_icu(cfg)
 
-        if args.wheel:
             for python in cfg.pythons:
-                step_wheel(cfg, python)
+                step_extension(cfg, python)
+
+            if args.skip_tests:
+                section("9/9 run tests")
+                log("    skipped (--skip-tests)")
+            else:
+                for python in cfg.pythons:
+                    step_tests(cfg, python)
+
+            if args.wheel:
+                for python in cfg.pythons:
+                    step_wheel(cfg, python)
     except BuildError as error:
         log("")
         log("BUILD FAILED: {}".format(error))

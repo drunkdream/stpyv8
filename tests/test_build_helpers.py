@@ -23,6 +23,30 @@ if ROOT not in sys.path:
 import build  # noqa: E402  (path set up above)
 
 
+class TestV8OnlyBuild(unittest.TestCase):
+    def test_detect_windows_sdk_version_picks_newest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            include_root = os.path.join(
+                tmp, "Windows Kits", "10", "Include"
+            )
+            os.makedirs(os.path.join(include_root, "10.0.22621.0"))
+            os.makedirs(os.path.join(include_root, "10.0.26100.0"))
+            os.makedirs(os.path.join(include_root, "10.0.19041.0"))
+
+            with mock.patch.dict(
+                os.environ, {"ProgramFiles(x86)": tmp}
+            ):
+                version = build.detect_windows_sdk_version()
+
+        self.assertEqual("10.0.26100.0", version)
+
+    def test_v8_only_flag_is_parsed(self):
+        args = build.parse_args(["--v8-only", "--skip-v8-sync"])
+        cfg = build.Config(args)
+
+        self.assertTrue(cfg.v8_only)
+
+
 class TestExtensionLoads(unittest.TestCase):
     """The load probe must distinguish a broken .so from a usable one."""
 
