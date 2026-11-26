@@ -213,6 +213,20 @@ class TestBoostVersionSingleSource(unittest.TestCase):
         self.assertIn("toolset=msvc-14.2", text)
         self.assertNotIn(".\\bootstrap.bat\n", text)
 
+    def test_windows_boost_uses_system_library_layout(self):
+        text = (
+            (Path(ROOT) / ".github" / "workflows" / "windows.yml")
+            .read_text(encoding="utf-8")
+        )
+
+        # settings.py links boost_pythonXY.lib / libboost_*.lib; the default
+        # versioned layout produces names like boost_pythonXY-vc142-mt-s-...
+        # and makes the extension link fail with LNK1181.
+        self.assertIn("--layout=system", text)
+        self.assertIn("vc142-layout-system", text)
+        self.assertIn("libboost_iostreams.lib", text)
+        self.assertIn("libboost_filesystem.lib", text)
+
     def test_workflows_read_boost_version_from_settings(self):
         workflows = []
         for path in sorted((Path(ROOT) / ".github" / "workflows").glob("*.yml")):
