@@ -201,6 +201,18 @@ class TestBoostVersionSingleSource(unittest.TestCase):
             settings.BOOST_VERSION.replace(".", "_"), settings.BOOST_VERSION_SNAKE
         )
 
+    def test_windows_boost_build_forces_v142(self):
+        text = (
+            (Path(ROOT) / ".github" / "workflows" / "windows.yml")
+            .read_text(encoding="utf-8")
+        )
+
+        # Boost 1.89's bundled b2 cannot auto-detect VS2026. Passing vc142
+        # explicitly avoids the "Unknown toolset: vcunk" bootstrap failure.
+        self.assertIn(".\\bootstrap.bat vc142", text)
+        self.assertIn("toolset=msvc-14.2", text)
+        self.assertNotIn(".\\bootstrap.bat\n", text)
+
     def test_workflows_read_boost_version_from_settings(self):
         workflows = []
         for path in sorted((Path(ROOT) / ".github" / "workflows").glob("*.yml")):

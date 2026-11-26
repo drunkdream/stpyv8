@@ -144,8 +144,15 @@ jobs:
         if: ${{ steps.restore-boost.outputs.cache-hit != 'true' }}
         working-directory: ${{ steps.install-boost.outputs.BOOST_ROOT }}
         run: |
-          .\bootstrap.bat
-          if (-not $?) { type bootstrap.log }
+          # Boost 1.89 ships b2 5.3.2, which cannot auto-detect VS2026 and
+          # reports "Unknown toolset: vcunk". vcvarsall was already invoked
+          # with toolset 14.2 above, so select vc142 explicitly here; this
+          # also writes `using msvc : 14.2 ;` into project-config.jam.
+          .\bootstrap.bat vc142
+          if ($LASTEXITCODE -ne 0) {
+            if (Test-Path bootstrap.log) { Get-Content bootstrap.log }
+            throw "Boost bootstrap failed with exit code $LASTEXITCODE"
+          }
 
           # Set specific Python version
           $escapedPythonPath = "${{ steps.install-python.outputs.python-path }}" -Replace "\\","\\"
@@ -154,7 +161,8 @@ jobs:
           # Patch bug affecting compilation on Python 3.10
           # https://github.com/boostorg/python/commit/cbd2d9f033c61d29d0a1df14951f4ec91e7d05cd
           (Get-Content libs\python\src\exec.cpp).replace('_Py_fopen', 'fopen') | Set-Content libs\python\src\exec.cpp
-          .\b2.exe stage -j 8 link=static runtime-link=static --with-python --with-filesystem --with-iostreams --with-date_time --with-thread
+          .\b2.exe stage -j 8 toolset=msvc-14.2 link=static runtime-link=static --with-python --with-filesystem --with-iostreams --with-date_time --with-thread
+          if ($LASTEXITCODE -ne 0) { throw "Boost build failed with exit code $LASTEXITCODE" }
           ls stage\lib
       - name: Save Boost to cache
         uses: actions/cache/save@main
