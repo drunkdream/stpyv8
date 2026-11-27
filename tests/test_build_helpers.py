@@ -56,7 +56,9 @@ class TestExtensionLoads(unittest.TestCase):
             missing = os.path.join(tmp, "_STPyV8.missing.so")
             ok, message = build._extension_loads(sys.executable, missing)
         self.assertFalse(ok)
-        self.assertIn("OSError", message)
+        self.assertTrue(
+            any(name in message for name in ("OSError", "FileNotFoundError"))
+        )
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux only")
     def test_loadable_library_passes(self):

@@ -53,6 +53,41 @@ std::string Timestamp()
 
 #ifdef _WIN32
 
+void PrintNativeStack(EXCEPTION_POINTERS *info)
+{
+    HANDLE process = ::GetCurrentProcess();
+
+    if (info && info->ExceptionRecord)
+        std::fprintf(stderr, "\nSTPyV8 fatal exception 0x%08lx at %p\n",
+                     static_cast<unsigned long>(info->ExceptionRecord->ExceptionCode),
+                     info->ExceptionRecord->ExceptionAddress);
+    else
+        std::fprintf(stderr, "\nSTPyV8 fatal exception\n");
+    std::fflush(stderr);
+
+    void *frames[128] = {};
+    USHORT count = ::CaptureStackBackTrace(1, 128, frames, nullptr);
+
+    for (USHORT i = 0; i < count; ++i)
+    {
+        DWORD64 address = reinterpret_cast<DWORD64>(frames[i]);
+        DWORD64 displacement = 0;
+
+        alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + MAX_SYM_NAME * sizeof(TCHAR)];
+        PSYMBOL_INFO symbol = reinterpret_cast<PSYMBOL_INFO>(buffer);
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = MAX_SYM_NAME;
+
+        if (::SymFromAddr(process, address, &displacement, symbol))
+            std::fprintf(stderr, "#%02u %p %s+0x%llx\n", i, frames[i], symbol->Name,
+                         static_cast<unsigned long long>(displacement));
+        else
+            std::fprintf(stderr, "#%02u %p\n", i, frames[i]);
+    }
+
+    std::fflush(stderr);
+}
+
 LONG WINAPI CrashExceptionFilter(EXCEPTION_POINTERS *info)
 {
     std::string path = CrashDumpDir() + "\\stpyv8-crash-" + Timestamp() + "-" +
@@ -73,6 +108,8 @@ LONG WINAPI CrashExceptionFilter(EXCEPTION_POINTERS *info)
                             info ? &mei : nullptr, nullptr, nullptr);
         ::CloseHandle(file);
     }
+
+    PrintNativeStack(info);
 
     // Continue searching so WER / a debugger still handle the crash and the
     // process terminates as usual.
@@ -115,6 +152,9 @@ void InstallCrashHandler()
         return;
 
 #ifdef _WIN32
+    ::SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES | SYMOPT_UNDNAME |
+                    SYMOPT_FAIL_CRITICAL_ERRORS);
+    ::SymInitialize(::GetCurrentProcess(), NULL, TRUE);
     ::SetUnhandledExceptionFilter(&CrashExceptionFilter);
 #else
     struct sigaction sa;

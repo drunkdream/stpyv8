@@ -8,7 +8,8 @@
 //   STPYV8_CRASH_DUMP=/some/dir    -> dump into that directory
 // Unset / "0" -> no handler is installed (default, zero overhead).
 //
-// Windows: a minidump (.dmp) via MiniDumpWriteDump (dbghelp).
+// Windows: a minidump (.dmp) via MiniDumpWriteDump (dbghelp) plus a symbolized
+//          native stack trace printed to stderr.
 // POSIX:   a backtrace text file, then the signal is re-raised with its
 //          default disposition so a core dump is still produced if enabled.
 void InstallCrashHandler();
