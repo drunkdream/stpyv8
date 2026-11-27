@@ -25,13 +25,21 @@ std::unique_ptr<v8::Locker> AcquireLocker(v8::Isolate *isolate)
     return locker;
 }
 
-std::unique_ptr<v8::Isolate::Scope> AcquireIsolateScope(v8::Isolate *isolate)
+std::unique_ptr<v8::Isolate::Scope> AcquireIsolateScope(v8::Isolate *isolate,
+                                                        bool acquired_locker)
 {
-    // Isolate::Enter() resets V8's stack limit to the current C stack pointer.
-    // Re-entering an isolate that is already current (e.g. every ctx.eval()
-    // while inside `with ctx`) would keep moving that limit down and, on
-    // stack-constrained platforms such as Windows CI, eventually crash.
-    if (v8::Isolate::GetCurrent() == isolate)
+    // Isolate::Enter() resets V8's stack start/limit to the current C stack
+    // pointer. Re-entering while already inside a context (e.g. every
+    // ctx.eval() within `with ctx`) would keep moving that limit and can crash
+    // on stack-constrained platforms, so skip that common path.
+    //
+    // A callback may hold a JSContext after `with` has exited. The context is
+    // then no longer current, so we must rebuild the isolate entry state even
+    // though Isolate::GetCurrent() still points at the same isolate. The same
+    // applies when this call acquired a fresh Locker: V8 may have freed the
+    // thread state when the previous Locker was released.
+    if (!acquired_locker && v8::Isolate::GetCurrent() == isolate &&
+            isolate->InContext())
         return nullptr;
 
     return std::unique_ptr<v8::Isolate::Scope>(new v8::Isolate::Scope(isolate));
@@ -48,7 +56,7 @@ public:
     ContextScopeGuard(v8::Isolate *isolate,
                       const v8::Persistent<v8::Context>& context)
         : m_locker(AcquireLocker(isolate)),
-          m_isolate_scope(AcquireIsolateScope(isolate)),
+          m_isolate_scope(AcquireIsolateScope(isolate, m_locker != nullptr)),
           m_handle_scope(isolate),
           m_context_scope(v8::Local<v8::Context>::New(isolate, context))
     {
