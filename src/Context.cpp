@@ -25,18 +25,30 @@ std::unique_ptr<v8::Locker> AcquireLocker(v8::Isolate *isolate)
     return locker;
 }
 
+std::unique_ptr<v8::Isolate::Scope> AcquireIsolateScope(v8::Isolate *isolate)
+{
+    // Isolate::Enter() resets V8's stack limit to the current C stack pointer.
+    // Re-entering an isolate that is already current (e.g. every ctx.eval()
+    // while inside `with ctx`) would keep moving that limit down and, on
+    // stack-constrained platforms such as Windows CI, eventually crash.
+    if (v8::Isolate::GetCurrent() == isolate)
+        return nullptr;
+
+    return std::unique_ptr<v8::Isolate::Scope>(new v8::Isolate::Scope(isolate));
+}
+
 class ContextScopeGuard
 {
     // Declared first so it is constructed before the V8 scopes below.
     std::unique_ptr<v8::Locker> m_locker;
-    v8::Isolate::Scope m_isolate_scope;
+    std::unique_ptr<v8::Isolate::Scope> m_isolate_scope;
     v8::HandleScope m_handle_scope;
     v8::Context::Scope m_context_scope;
 public:
     ContextScopeGuard(v8::Isolate *isolate,
                       const v8::Persistent<v8::Context>& context)
         : m_locker(AcquireLocker(isolate)),
-          m_isolate_scope(isolate),
+          m_isolate_scope(AcquireIsolateScope(isolate)),
           m_handle_scope(isolate),
           m_context_scope(v8::Local<v8::Context>::New(isolate, context))
     {
