@@ -201,6 +201,9 @@ jobs:
           key: windows-build-v8-${{ matrix.os }}-${{ needs.build-v8.outputs.v8-hash }}
       - name: Build wheel
         env:
+          # Emit a PDB for symbolized native crash stacks. setup.py strips it from
+          # the wheel, but the .pyd still embeds its path for dbghelp.
+          STPYV8_PDB: 1
           # Set include and library files which will be picked up by setuptools
           INCLUDE: ${{ env.INCLUDE }};${{ steps.install-python.outputs.python-path
             }}include
@@ -226,6 +229,9 @@ jobs:
             exit 1
           }
       - name: Test wheel
+        env:
+          # Install the crash filter so native stacks are printed to stderr.
+          STPYV8_CRASH_DUMP: 1
         run: |
           pytest -v
       - name: Upload wheel
