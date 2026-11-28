@@ -215,6 +215,8 @@ void InstallCrashHandler()
     // the native stack is printed even when Python terminates the process.
     ::AddVectoredExceptionHandler(1, VectoredExceptionHandler);
     ::SetUnhandledExceptionFilter(&CrashExceptionFilter);
+    std::fprintf(stderr, "[STPyV8] crash handler installed (VEH + dump)\n");
+    std::fflush(stderr);
 #else
     struct sigaction sa;
     std::memset(&sa, 0, sizeof(sa));
