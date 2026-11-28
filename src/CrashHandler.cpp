@@ -184,8 +184,11 @@ LONG CALLBACK VectoredExceptionHandler(PEXCEPTION_POINTERS info)
     if (::InterlockedCompareExchange(&s_crashed, 1, 0) != 0)
         return EXCEPTION_CONTINUE_SEARCH;
 
-    WriteMiniDump(info);
+    // Print the stack first: MiniDumpWriteDump is a heavy dbghelp call and can
+    // itself fail or re-raise inside a corrupted crashing process, which would
+    // prevent the stack from ever being written. The dump is best-effort.
     PrintNativeStack(info);
+    WriteMiniDump(info);
 
     // Continue the normal SEH chain so Python's faulthandler can still print
     // the Python stack and the process terminates as usual.
@@ -197,8 +200,8 @@ LONG WINAPI CrashExceptionFilter(EXCEPTION_POINTERS *info)
     // Fallback for exceptions that never reached the vectored handler.
     if (::InterlockedCompareExchange(&s_crashed, 1, 0) == 0)
     {
-        WriteMiniDump(info);
         PrintNativeStack(info);
+        WriteMiniDump(info);
     }
 
     return EXCEPTION_CONTINUE_SEARCH;
