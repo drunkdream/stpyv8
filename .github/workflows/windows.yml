@@ -231,9 +231,17 @@ jobs:
       - name: Test wheel
         env:
           # Install the crash filter so native stacks are printed to stderr.
-          STPYV8_CRASH_DUMP: 1
+          STPYV8_CRASH_DUMP: ${{ github.workspace }}/crashes
         run: |
+          New-Item -ItemType Directory -Force -Path crashes | Out-Null
           pytest -v
+      - name: Upload crash stacks
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stpyv8-crashes-${{ matrix.os }}-python${{ matrix.python-version }}
+          path: crashes/*
+          if-no-files-found: ignore
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:

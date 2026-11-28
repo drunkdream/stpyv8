@@ -4,6 +4,7 @@
 
 #include "CrashHandler.h"
 
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -88,16 +89,37 @@ volatile LONG s_crashed = 0;
 
 void PrintNativeStack(EXCEPTION_POINTERS *info)
 {
-    HANDLE process = ::GetCurrentProcess();
+    // pytest captures fd 2 by dup2-ing it to a temp file; a crashing process
+    // loses that buffer. Rebind stderr to the real console so the stack is
+    // visible in CI logs, and also persist it next to the minidump.
+    FILE *out = stderr;
+    if (FILE *console = std::freopen("CONOUT$", "w", stderr))
+        out = console;
+
+    std::string stackPath = CrashDumpDir() + "\\stpyv8-crash-" + Timestamp() + "-" +
+                            std::to_string(::GetCurrentProcessId()) + ".stack.txt";
+    FILE *file = std::fopen(stackPath.c_str(), "w");
+
+    auto emit = [out, file](const char *fmt, ...) {
+        va_list args;
+        va_start(args, fmt);
+        std::vfprintf(out, fmt, args);
+        if (file)
+            std::vfprintf(file, fmt, args);
+        va_end(args);
+    };
 
     if (info && info->ExceptionRecord)
-        std::fprintf(stderr, "\nSTPyV8 fatal exception 0x%08lx at %p\n",
-                     static_cast<unsigned long>(info->ExceptionRecord->ExceptionCode),
-                     info->ExceptionRecord->ExceptionAddress);
+        emit("\nSTPyV8 fatal exception 0x%08lx at %p\n",
+             static_cast<unsigned long>(info->ExceptionRecord->ExceptionCode),
+             info->ExceptionRecord->ExceptionAddress);
     else
-        std::fprintf(stderr, "\nSTPyV8 fatal exception\n");
-    std::fflush(stderr);
+        emit("\nSTPyV8 fatal exception\n");
+    std::fflush(out);
+    if (file)
+        std::fflush(file);
 
+    HANDLE process = ::GetCurrentProcess();
     void *frames[128] = {};
     USHORT count = ::CaptureStackBackTrace(1, 128, frames, nullptr);
 
@@ -112,13 +134,15 @@ void PrintNativeStack(EXCEPTION_POINTERS *info)
         symbol->MaxNameLen = MAX_SYM_NAME;
 
         if (::SymFromAddr(process, address, &displacement, symbol))
-            std::fprintf(stderr, "#%02u %p %s+0x%llx\n", i, frames[i], symbol->Name,
-                         static_cast<unsigned long long>(displacement));
+            emit("#%02u %p %s+0x%llx\n", i, frames[i], symbol->Name,
+                 static_cast<unsigned long long>(displacement));
         else
-            std::fprintf(stderr, "#%02u %p\n", i, frames[i]);
+            emit("#%02u %p\n", i, frames[i]);
     }
 
-    std::fflush(stderr);
+    std::fflush(out);
+    if (file)
+        std::fclose(file);
 }
 
 void WriteMiniDump(EXCEPTION_POINTERS *info)
