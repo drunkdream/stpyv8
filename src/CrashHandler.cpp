@@ -89,24 +89,22 @@ volatile LONG s_crashed = 0;
 
 void PrintNativeStack(EXCEPTION_POINTERS *info)
 {
-    // pytest captures fd 2 by dup2-ing it to a temp file; a crashing process
-    // loses that buffer. Rebind stderr to the real console so the stack is
-    // visible in CI logs, and also persist it next to the minidump.
-    FILE *out = stderr;
-    if (FILE *console = std::freopen("CONOUT$", "w", stderr))
-        out = console;
-
-    std::string stackPath = CrashDumpDir() + "\\stpyv8-crash-" + Timestamp() + "-" +
-                            std::to_string(::GetCurrentProcessId()) + ".stack.txt";
-    FILE *file = std::fopen(stackPath.c_str(), "w");
-
-    auto emit = [out, file](const char *fmt, ...) {
+    // This runs inside a vectored exception handler. Avoid CRT file I/O
+    // (fopen/freopen/fprintf) -- it can allocate or take locks and crash
+    // recursively. Format into a stack buffer, then write with Win32 only:
+    // GetStdHandle(STD_ERROR_HANDLE) bypasses pytest's dup2 of fd 2, and a
+    // file beside the dump survives even if console output is redirected.
+    char text[16384];
+    size_t len = 0;
+    auto emit = [&text, &len](const char *fmt, ...) {
+        if (len + 1024 > sizeof(text))
+            return;
         va_list args;
         va_start(args, fmt);
-        std::vfprintf(out, fmt, args);
-        if (file)
-            std::vfprintf(file, fmt, args);
+        int n = std::vsnprintf(text + len, sizeof(text) - len, fmt, args);
         va_end(args);
+        if (n > 0)
+            len += static_cast<size_t>(n);
     };
 
     if (info && info->ExceptionRecord)
@@ -115,9 +113,6 @@ void PrintNativeStack(EXCEPTION_POINTERS *info)
              info->ExceptionRecord->ExceptionAddress);
     else
         emit("\nSTPyV8 fatal exception\n");
-    std::fflush(out);
-    if (file)
-        std::fflush(file);
 
     HANDLE process = ::GetCurrentProcess();
     void *frames[128] = {};
@@ -140,9 +135,22 @@ void PrintNativeStack(EXCEPTION_POINTERS *info)
             emit("#%02u %p\n", i, frames[i]);
     }
 
-    std::fflush(out);
-    if (file)
-        std::fclose(file);
+    // Console: real stderr handle, not affected by pytest's fd capture.
+    HANDLE stderrHandle = ::GetStdHandle(STD_ERROR_HANDLE);
+    DWORD written = 0;
+    if (stderrHandle != INVALID_HANDLE_VALUE && stderrHandle != nullptr)
+        ::WriteFile(stderrHandle, text, static_cast<DWORD>(len), &written, nullptr);
+
+    // Persist next to the minidump for artifact upload.
+    std::string stackPath = CrashDumpDir() + "\\stpyv8-crash-" + Timestamp() + "-" +
+                            std::to_string(::GetCurrentProcessId()) + ".stack.txt";
+    HANDLE file = ::CreateFileA(stackPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        ::WriteFile(file, text, static_cast<DWORD>(len), &written, nullptr);
+        ::CloseHandle(file);
+    }
 }
 
 void WriteMiniDump(EXCEPTION_POINTERS *info)
