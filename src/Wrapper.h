@@ -4,17 +4,32 @@
 #include <memory>
 #include <iostream>
 #include <map>
+#include <mutex>
+#include <set>
+#include <unordered_map>
 #include <sstream>
 
-#include <boost/iterator/iterator_facade.hpp>
-
 #include "Exception.h"
+
+#include <boost/iterator/iterator_facade.hpp>
 
 class CJavascriptObject;
 class CJavascriptFunction;
 
 typedef std::shared_ptr<CJavascriptObject> CJavascriptObjectPtr;
 typedef std::shared_ptr<CJavascriptFunction> CJavascriptFunctionPtr;
+
+// Per-isolate resource registry. Templates and the Python objects handed to V8
+// as External payloads are owned here so they can be released BEFORE
+// v8::Isolate::Dispose() invalidates the isolate's global handles. A CContext
+// whose isolate is no longer registered must not call any V8 API on its
+// Persistent<Context> (the handle is already gone).
+namespace IsolateRegistry
+{
+    void Register(v8::Isolate *isolate);
+    void Forget(v8::Isolate *isolate);
+    bool IsAlive(v8::Isolate *isolate);
+}
 
 class CJavascriptObject;
 
@@ -30,19 +45,53 @@ private:
     virtual ~CPythonObject();
 
 public:
-    static void NamedGetter(v8::Local<v8::Name> prop, const v8::PropertyCallbackInfo<v8::Value>& info);
-    static void NamedSetter(v8::Local<v8::Name> prop, v8::Local<v8::Value> value, const v8::PropertyCallbackInfo<v8::Value>& info);
-    static void NamedQuery(v8::Local<v8::Name> prop, const v8::PropertyCallbackInfo<v8::Integer>& info);
-    static void NamedDeleter(v8::Local<v8::Name> prop, const v8::PropertyCallbackInfo<v8::Boolean>& info);
+    static v8::Intercepted NamedGetter(v8::Local<v8::Name> prop, const v8::PropertyCallbackInfo<v8::Value>& info);
+    static v8::Intercepted NamedSetter(v8::Local<v8::Name> prop, v8::Local<v8::Value> value, const v8::PropertyCallbackInfo<void>& info);
+    static v8::Intercepted NamedQuery(v8::Local<v8::Name> prop, const v8::PropertyCallbackInfo<v8::Integer>& info);
+    static v8::Intercepted NamedDeleter(v8::Local<v8::Name> prop, const v8::PropertyCallbackInfo<v8::Boolean>& info);
     static void NamedEnumerator(const v8::PropertyCallbackInfo<v8::Array>& info);
 
-    static void IndexedGetter(uint32_t index, const v8::PropertyCallbackInfo<v8::Value>& info);
-    static void IndexedSetter(uint32_t index, v8::Local<v8::Value> value, const v8::PropertyCallbackInfo<v8::Value>& info);
-    static void IndexedQuery(uint32_t index, const v8::PropertyCallbackInfo<v8::Integer>& info);
-    static void IndexedDeleter(uint32_t index, const v8::PropertyCallbackInfo<v8::Boolean>& info);
+    static v8::Intercepted IndexedGetter(uint32_t index, const v8::PropertyCallbackInfo<v8::Value>& info);
+    static v8::Intercepted IndexedSetter(uint32_t index, v8::Local<v8::Value> value, const v8::PropertyCallbackInfo<void>& info);
+    static v8::Intercepted IndexedQuery(uint32_t index, const v8::PropertyCallbackInfo<v8::Integer>& info);
+    static v8::Intercepted IndexedDeleter(uint32_t index, const v8::PropertyCallbackInfo<v8::Boolean>& info);
     static void IndexedEnumerator(const v8::PropertyCallbackInfo<v8::Array>& info);
 
     static void Caller(const v8::FunctionCallbackInfo<v8::Value>& info);
+
+    // [[@@iterator]] for Python objects that define __iter__. Installs onto the
+    // prototype template as Symbol.iterator so `[...obj]` / `for...of` /
+    // Array.from(obj) work like they do for real browser collection objects.
+    static void IterateCallback(const v8::FunctionCallbackInfo<v8::Value>& info);
+
+    // Python awaitable (coroutine / Task / Future / any object with __await__)
+    // -> JS Promise. The asyncio loop must run on the isolate's thread: the
+    // done callback settles the resolver directly, without taking v8::Locker.
+    static v8::Local<v8::Value> CreateAwaitablePromise(py::object awaitable);
+    static void CoroSettle(unsigned long long id, bool ok, py::object value);
+    // Drop the bridges belonging to a context that is being destroyed. Makes
+    // no V8 calls, so it is safe even after JSContext.__exit__ has left the
+    // isolate (where DisposeContext cannot run).
+    static void ForgetContext(v8::Isolate *isolate, int contextId);
+
+    // The class's OWN Python members are installed as REAL properties on the
+    // function template's PrototypeTemplate (see PopulatePrototypeMethods):
+    // @property -> native V8 AccessorPair, methods -> data property with a
+    // self-binding FunctionTemplate, constants -> data property.
+    //
+    // Real properties (rather than interceptor-synthesised "virtual" ones) are
+    // required because V8's Annex B __lookupGetter__/__lookupSetter__ walk the
+    // chain with PROTOTYPE_CHAIN_SKIP_INTERCEPTOR and cannot see virtual members.
+    // They also make all six ordinary internal methods consistent without any
+    // callback coordination. Inherited members come from tmpl->Inherit(base).
+    //
+    // The accessor/method callbacks apply a WebIDL brand check
+    // (ResolveBrandedReceiver): a non-instance receiver throws
+    // "Illegal invocation", matching Chrome's Element.prototype.scrollTop.
+    static void PrototypeMethod(const v8::FunctionCallbackInfo<v8::Value>& info);
+    static void PrototypeAccessorGet(const v8::FunctionCallbackInfo<v8::Value>& info);
+    static void PrototypeAccessorSet(const v8::FunctionCallbackInfo<v8::Value>& info);
+    static void PopulatePrototypeMethods(v8::Isolate *isolate, py::object cls, v8::Local<v8::FunctionTemplate> tmpl);
 
 #ifdef SUPPORT_TRACE_LIFECYCLE
     static void DisposeCallback(v8::Persistent<v8::Value> object, void* parameter);
@@ -50,10 +99,39 @@ public:
 
     static void SetupObjectTemplate(v8::Isolate *isolate, v8::Handle<v8::ObjectTemplate> clazz);
     static v8::Handle<v8::ObjectTemplate> CreateObjectTemplate(v8::Isolate *isolate);
+    // Returns the ObjectTemplate belonging to `isolate`, creating (and caching)
+    // one on first use. A v8::ObjectTemplate may only be used with the isolate
+    // that created it, so it must never be shared across isolates.
+    static v8::Local<v8::ObjectTemplate> GetObjectTemplate(v8::Isolate *isolate);
+
+    // Returns (creating and caching per isolate) a FunctionTemplate modelling
+    // the given Python class. Instances get this class's prototype -- so the JS
+    // prototype chain mirrors the Python MRO and `instanceof` works -- and the
+    // class itself is exposed as the matching constructor function.
+    static v8::Local<v8::FunctionTemplate> GetClassTemplate(v8::Isolate *isolate, py::object cls);
+
+    // Exposes the Python class's own attributes (class/static attributes,
+    // classmethods, staticmethods, nested classes, ...) as own properties on the
+    // given constructor function, so that e.g. `XMLHttpRequest.UNSENT` reads the
+    // class attribute directly instead of having to be mounted by hand in JS.
+    // V8 creates one function object per context, so a fresh function in a new
+    // context is re-populated; within a context we do it only once.
+    static void PopulateStaticProperties(v8::Isolate *isolate, py::object cls, v8::Local<v8::Object> func);
 
     static v8::Handle<v8::Value> WrapInternal(py::object obj);
 
     static bool IsWrapped(v8::Handle<v8::Object> obj);
+
+    // True when the Python type of `obj` lists `name` in `__js_hidden__`.
+    // Such names are reported to JS as if they did not exist, which is the only
+    // way to keep a Python attribute private: the named-property interceptors
+    // forward the requested name verbatim to PyObject_GetAttrString /
+    // PyObject_HasAttrString / PyObject_DelAttrString, i.e. JS is given exactly
+    // the attribute access that Python's getattr()/hasattr()/delattr() have --
+    // including Python's private-name mangling, which is a collision-avoidance
+    // convention rather than an access control.
+    static bool IsJsHiddenName(PyObject *obj, const std::string& name);
+
     static v8::Handle<v8::Value> Wrap(py::object obj);
     static py::object Unwrap(v8::Handle<v8::Object> obj);
     static void Dispose(v8::Handle<v8::Value> value);
@@ -80,6 +158,17 @@ public:
     CJavascriptObject(v8::Handle<v8::Object> obj)
         : m_obj(v8::Isolate::GetCurrent(), obj)
     {
+    }
+
+    // v8::Persistent is no longer copyable (its default traits are
+    // NonCopyablePersistentTraits), so an implicit copy constructor would
+    // instantiate the deleted Copy helper. Re-create a new persistent handle
+    // pointing at the same JS object instead.
+    CJavascriptObject(const CJavascriptObject& other)
+    {
+        v8::Isolate* isolate = v8::Isolate::GetCurrent();
+        v8::HandleScope handle_scope(isolate);
+        m_obj.Reset(isolate, other.Object());
     }
 
     virtual ~CJavascriptObject()
@@ -112,12 +201,23 @@ public:
 
     void Dump(std::ostream& os) const;
 
+    // Returns the same textual representation as Dump(). Registered explicitly
+    // as Python's __str__: relying on boost::python's `str(self)` (which streams
+    // the object) picks up the implicit conversion to double instead and prints
+    // "nan" for every non-numeric value.
+    const std::string str(void) const;
+
     static py::object Wrap(CJavascriptObject *obj);
     static py::object Wrap(v8::Handle<v8::Value> value,
                            v8::Handle<v8::Object> self = v8::Handle<v8::Object>());
     static py::object Wrap(v8::Handle<v8::Object> obj,
                            v8::Handle<v8::Object> self = v8::Handle<v8::Object>());
 };
+
+// boost::python's `str(self)` streams the object. Without this overload the
+// implicit conversion to double (via `operator double()`) is selected instead,
+// which prints "nan" for every value that is not a number.
+std::ostream& operator<<(std::ostream& os, const CJavascriptObject& obj);
 
 class CJavascriptNull : public CJavascriptObject
 {
@@ -269,7 +369,19 @@ public:
 
     void Dispose(void);
 
+    // Forget the owning map so the destructor does not touch it. The handle is
+    // intentionally left alone: V8 requires each weak callback to Reset() its
+    // own handle, and no other code may do it on that handle's behalf.
+    void DetachFromMap(void) {
+        m_living = nullptr;
+    }
+
     static ObjectTracer& Trace(v8::Handle<v8::Value> handle, py::object *object);
+
+    // Release the ContextTracer (and every ObjectTracer) attached to `ctxt`,
+    // freeing the Python objects they own. Called from an owning CContext
+    // destructor while the context is still valid.
+    static void DisposeContext(v8::Isolate *isolate, v8::Handle<v8::Context> ctxt);
 
     static v8::Handle<v8::Value> FindCache(py::object obj);
 };
@@ -278,6 +390,9 @@ class ContextTracer
 {
     v8::Persistent<v8::Context> m_ctxt;
     std::unique_ptr<LivingMap> m_living;
+    // The isolate this tracer belongs to; used to unregister it from the
+    // per-isolate registry when it is destroyed.
+    v8::Isolate *m_isolate;
 
     void Trace(void);
 
@@ -290,7 +405,11 @@ public:
         return v8::Local<v8::Context>::New(v8::Isolate::GetCurrent(), m_ctxt);
     }
 
-    static void Trace(v8::Handle<v8::Context> ctxt, LivingMap *living);
+    // Manual teardown, invoked while the context is still alive: cancel the
+    // weak callback so it cannot fire after the tracers have been freed.
+    void Dispose(void);
+
+    static ContextTracer* Trace(v8::Handle<v8::Context> ctxt, LivingMap *living);
 };
 
 #endif

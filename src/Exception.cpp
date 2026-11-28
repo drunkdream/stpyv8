@@ -1,4 +1,5 @@
 #include <sstream>
+
 #include "Exception.h"
 
 std::ostream& operator<<(std::ostream& os, const CJavascriptException& ex)
@@ -284,10 +285,23 @@ const std::string CJavascriptException::Extract(v8::Isolate *isolate, v8::TryCat
 
     std::ostringstream oss;
 
+    // Cap the exception text: a minified bundle can put megabytes into a single
+    // Error message (or one source line), and every throw used to allocate a
+    // string of that size -- enough to OOM the V8 heap when errors are raised in
+    // a loop. Keep enough context to locate the failure and drop the rest.
+    static const size_t kMaxMessageChars = 4096;
+
     v8::String::Utf8Value msg(isolate, try_catch.Exception());
 
     if (*msg)
-        oss << std::string(*msg, msg.length());
+    {
+        size_t n = (size_t) msg.length();
+
+        oss << std::string(*msg, n > kMaxMessageChars ? kMaxMessageChars : n);
+
+        if (n > kMaxMessageChars)
+            oss << "... (" << n << " chars)";
+    }
 
     v8::Handle<v8::Message> message = try_catch.Message();
 
@@ -310,11 +324,39 @@ const std::string CJavascriptException::Extract(v8::Isolate *isolate, v8::TryCat
         {
             v8::String::Utf8Value line(isolate, message->GetSourceLine(isolate->GetCurrentContext()).ToLocalChecked());
 
-            oss << " -> " << std::string(*line, line.length());
+            if (*line)
+            {
+                // 压缩后的 bundle 常是单行数 MB，整行拼进异常消息会让每次
+                // 异常都分配 MB 级字符串（实测 1.8MB 源码 -> 1.8MB 异常串），
+                // 高频抛异常时直接把 V8 堆撑爆（sports.qq.com OOM 的根因）。
+                // 截断到 200 字符足够定位出错位置。
+                const size_t kMax = 200;
+                size_t n = (size_t) line.length();
+
+                oss << " -> " << std::string(*line, n > kMax ? kMax : n);
+
+                if (n > kMax)
+                    oss << "... (" << n << " chars)";
+            }
         }
     }
 
-    return oss.str();
+    // Hard cap on the WHOLE string as well: the message, resource name, line
+    // numbers and source line are capped individually above, but their sum can
+    // still exceed the budget. Callers (and the tests) may rely on a bounded
+    // exception string, so enforce it once here. Leave room for the Python-side
+    // prefix (e.g. "JSError: ") that the translator prepends.
+    static const size_t kMaxTotalChars = 4000;
+
+    std::string text = oss.str();
+
+    if (text.size() > kMaxTotalChars)
+    {
+        text.resize(kMaxTotalChars - 20);
+        text += "... (truncated)";
+    }
+
+    return text;
 }
 
 static struct {

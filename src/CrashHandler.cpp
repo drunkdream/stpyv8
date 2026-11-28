@@ -1,0 +1,265 @@
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
+#include "CrashHandler.h"
+
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <string>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <dbghelp.h>
+#else
+#include <signal.h>
+#include <unistd.h>
+#include <execinfo.h>
+#endif
+
+namespace
+{
+
+bool CrashDumpEnabled()
+{
+    const char *v = std::getenv("STPYV8_CRASH_DUMP");
+    return v && *v && std::strcmp(v, "0") != 0;
+}
+
+std::string CrashDumpDir()
+{
+    const char *v = std::getenv("STPYV8_CRASH_DUMP");
+    // "1" (or empty) means "use the current working directory".
+    if (v && *v && std::strcmp(v, "1") != 0)
+        return std::string(v);
+    return ".";
+}
+
+std::string Timestamp()
+{
+    std::time_t t = std::time(nullptr);
+    std::tm tm_buf;
+#ifdef _WIN32
+    localtime_s(&tm_buf, &t);
+#else
+    localtime_r(&t, &tm_buf);
+#endif
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y%m%d-%H%M%S", &tm_buf);
+    return std::string(buf);
+}
+
+#ifdef _WIN32
+
+// Only crash-worthy exceptions; ignore first-chance C++ / SEH exceptions that
+// are handled normally (0xe06d7363 et al).
+bool IsFatalException(DWORD code)
+{
+    switch (code)
+    {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_BREAKPOINT:
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+    case EXCEPTION_DATATYPE_MISALIGNMENT:
+    case EXCEPTION_FLT_DENORMAL_OPERAND:
+    case EXCEPTION_FLT_DIVIDE_BY_ZERO:
+    case EXCEPTION_FLT_INEXACT_RESULT:
+    case EXCEPTION_FLT_INVALID_OPERATION:
+    case EXCEPTION_FLT_OVERFLOW:
+    case EXCEPTION_FLT_STACK_CHECK:
+    case EXCEPTION_FLT_UNDERFLOW:
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_IN_PAGE_ERROR:
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case EXCEPTION_INT_OVERFLOW:
+    case EXCEPTION_INVALID_DISPOSITION:
+    case EXCEPTION_NONCONTINUABLE_EXCEPTION:
+    case EXCEPTION_PRIV_INSTRUCTION:
+    case EXCEPTION_STACK_OVERFLOW:
+        return true;
+    default:
+        return false;
+    }
+}
+
+volatile LONG s_crashed = 0;
+
+void PrintNativeStack(EXCEPTION_POINTERS *info)
+{
+    // This runs inside a vectored exception handler. Avoid CRT file I/O
+    // (fopen/freopen/fprintf) -- it can allocate or take locks and crash
+    // recursively. Format into a stack buffer, then write with Win32 only:
+    // GetStdHandle(STD_ERROR_HANDLE) bypasses pytest's dup2 of fd 2, and a
+    // file beside the dump survives even if console output is redirected.
+    char text[16384];
+    size_t len = 0;
+    auto emit = [&text, &len](const char *fmt, ...) {
+        if (len + 1024 > sizeof(text))
+            return;
+        va_list args;
+        va_start(args, fmt);
+        int n = std::vsnprintf(text + len, sizeof(text) - len, fmt, args);
+        va_end(args);
+        if (n > 0)
+            len += static_cast<size_t>(n);
+    };
+
+    if (info && info->ExceptionRecord)
+        emit("\nSTPyV8 fatal exception 0x%08lx at %p\n",
+             static_cast<unsigned long>(info->ExceptionRecord->ExceptionCode),
+             info->ExceptionRecord->ExceptionAddress);
+    else
+        emit("\nSTPyV8 fatal exception\n");
+
+    HANDLE process = ::GetCurrentProcess();
+    void *frames[128] = {};
+    USHORT count = ::CaptureStackBackTrace(1, 128, frames, nullptr);
+
+    for (USHORT i = 0; i < count; ++i)
+    {
+        DWORD64 address = reinterpret_cast<DWORD64>(frames[i]);
+        DWORD64 displacement = 0;
+
+        alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + MAX_SYM_NAME * sizeof(TCHAR)];
+        PSYMBOL_INFO symbol = reinterpret_cast<PSYMBOL_INFO>(buffer);
+        symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+        symbol->MaxNameLen = MAX_SYM_NAME;
+
+        if (::SymFromAddr(process, address, &displacement, symbol))
+            emit("#%02u %p %s+0x%llx\n", i, frames[i], symbol->Name,
+                 static_cast<unsigned long long>(displacement));
+        else
+            emit("#%02u %p\n", i, frames[i]);
+    }
+
+    // Console: real stderr handle, not affected by pytest's fd capture.
+    HANDLE stderrHandle = ::GetStdHandle(STD_ERROR_HANDLE);
+    DWORD written = 0;
+    if (stderrHandle != INVALID_HANDLE_VALUE && stderrHandle != nullptr)
+        ::WriteFile(stderrHandle, text, static_cast<DWORD>(len), &written, nullptr);
+
+    // Persist next to the minidump for artifact upload.
+    std::string stackPath = CrashDumpDir() + "\\stpyv8-crash-" + Timestamp() + "-" +
+                            std::to_string(::GetCurrentProcessId()) + ".stack.txt";
+    HANDLE file = ::CreateFileA(stackPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        ::WriteFile(file, text, static_cast<DWORD>(len), &written, nullptr);
+        ::CloseHandle(file);
+    }
+}
+
+void WriteMiniDump(EXCEPTION_POINTERS *info)
+{
+    std::string path = CrashDumpDir() + "\\stpyv8-crash-" + Timestamp() + "-" +
+                       std::to_string(::GetCurrentProcessId()) + ".dmp";
+
+    HANDLE file = ::CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return;
+
+    MINIDUMP_EXCEPTION_INFORMATION mei;
+    mei.ThreadId = ::GetCurrentThreadId();
+    mei.ExceptionPointers = info;
+    mei.ClientPointers = FALSE;
+
+    ::MiniDumpWriteDump(::GetCurrentProcess(), ::GetCurrentProcessId(), file,
+                        static_cast<MINIDUMP_TYPE>(MiniDumpWithDataSegs |
+                                                   MiniDumpWithHandleData),
+                        info ? &mei : nullptr, nullptr, nullptr);
+    ::CloseHandle(file);
+}
+
+LONG CALLBACK VectoredExceptionHandler(PEXCEPTION_POINTERS info)
+{
+    if (!info || !info->ExceptionRecord ||
+            !IsFatalException(info->ExceptionRecord->ExceptionCode))
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    if (::InterlockedCompareExchange(&s_crashed, 1, 0) != 0)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    // Print the stack first: MiniDumpWriteDump is a heavy dbghelp call and can
+    // itself fail or re-raise inside a corrupted crashing process, which would
+    // prevent the stack from ever being written. The dump is best-effort.
+    PrintNativeStack(info);
+    WriteMiniDump(info);
+
+    // Continue the normal SEH chain so Python's faulthandler can still print
+    // the Python stack and the process terminates as usual.
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+LONG WINAPI CrashExceptionFilter(EXCEPTION_POINTERS *info)
+{
+    // Fallback for exceptions that never reached the vectored handler.
+    if (::InterlockedCompareExchange(&s_crashed, 1, 0) == 0)
+    {
+        PrintNativeStack(info);
+        WriteMiniDump(info);
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+#else  // POSIX
+
+void FatalSignalHandler(int sig, siginfo_t * /*info*/, void * /*ctx*/)
+{
+    // Not async-signal-safe, but this is a last-resort crash logger.
+    std::string path = CrashDumpDir() + "/stpyv8-crash-" + Timestamp() + "-" +
+                       std::to_string(::getpid()) + ".txt";
+
+    void *frames[128];
+    int n = ::backtrace(frames, 128);
+
+    FILE *f = std::fopen(path.c_str(), "w");
+    if (f)
+    {
+        std::fprintf(f, "STPyV8 fatal signal %d (%s)\n", sig, strsignal(sig));
+        std::fflush(f);
+        ::backtrace_symbols_fd(frames, n, fileno(f));
+        std::fclose(f);
+    }
+
+    // Restore the default disposition and re-raise so the exit status reflects
+    // the signal and a core dump is produced when enabled.
+    ::signal(sig, SIG_DFL);
+    ::raise(sig);
+}
+
+#endif
+
+}  // namespace
+
+void InstallCrashHandler()
+{
+    if (!CrashDumpEnabled())
+        return;
+
+#ifdef _WIN32
+    ::SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES | SYMOPT_UNDNAME |
+                    SYMOPT_FAIL_CRITICAL_ERRORS);
+    ::SymInitialize(::GetCurrentProcess(), NULL, TRUE);
+    // VEH runs before every SEH handler (including pytest's faulthandler), so
+    // the native stack is printed even when Python terminates the process.
+    ::AddVectoredExceptionHandler(1, VectoredExceptionHandler);
+    ::SetUnhandledExceptionFilter(&CrashExceptionFilter);
+    std::fprintf(stderr, "[STPyV8] crash handler installed (VEH + dump)\n");
+    std::fflush(stderr);
+#else
+    struct sigaction sa;
+    std::memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = &FatalSignalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    const int signals[] = {SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL};
+    for (int s : signals)
+        ::sigaction(s, &sa, nullptr);
+#endif
+}

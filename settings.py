@@ -4,20 +4,64 @@ import platform
 
 STPYV8_HOME = os.path.dirname(os.path.realpath(__file__))
 DEPOT_HOME = os.environ.get("DEPOT_HOME", os.path.join(STPYV8_HOME, "depot_tools"))
-V8_HOME = os.environ.get("V8_HOME", os.path.join(STPYV8_HOME, "v8"))
-BOOST_HOME = os.environ.get("BOOST_HOME", os.path.join(STPYV8_HOME, "boost"))
+V8_HOME = os.environ.get("V8_HOME", os.path.join(STPYV8_HOME, ".build", "v8"))
 
 V8_GIT_URL = "https://chromium.googlesource.com/v8/v8.git"
-V8_GIT_TAG_STABLE = "10.5.218.7"
+V8_GIT_TAG_STABLE = "13.1.201.22"
 V8_GIT_TAG_MASTER = "master"
 V8_GIT_TAG = V8_GIT_TAG_STABLE
 DEPOT_GIT_URL = "https://chromium.googlesource.com/chromium/tools/depot_tools.git"
-BOOST_VERSION = "1.76.0"
-BOOST_ROOT = os.path.join(BOOST_HOME, "boost_%s" % BOOST_VERSION.replace(".", "_"))
 
-STPYV8_VERSION = V8_GIT_TAG_STABLE
+BOOST_GIT_URL = "https://github.com/boostorg/boost.git"
+# Pin the Boost release to build against (release tags look like "boost-1.89.0").
+# build.py checks this tag out directly when cloning the source tree.
+# NOTE: Python 3.13/3.14 need a recent Boost.Python; 1.87 is too old for them.
+# If a newer CPython fails to build its boost_pythonXY, bump this to the latest
+# Boost tag.
+BOOST_GIT_TAG = "boost-1.89.0"
+# Archive/cache helpers derived from the single pin above, so CI workflows can
+# stay in sync with the source the local build uses.
+BOOST_VERSION = (
+    BOOST_GIT_TAG[len("boost-") :]
+    if BOOST_GIT_TAG.startswith("boost-")
+    else BOOST_GIT_TAG
+)
+BOOST_VERSION_SNAKE = BOOST_VERSION.replace(".", "_")
+
+# Allow the wheel version to be overridden (e.g. a local patch suffix such as
+# "13.1.201.22.post1") without changing the V8 tag that gets checked out/built.
+STPYV8_VERSION = os.environ.get("STPYV8_VERSION", V8_GIT_TAG_STABLE)
 
 v8_deps_linux = os.environ.get("V8_DEPS_LINUX", "1") in ("1",)
+
+
+def _export_visual_studio_install():
+    """Expose VSINSTALLDIR to depot_tools' V8 build scripts.
+
+    msvc-dev-cmd (and vcvarsall) set the standard ``VSINSTALLDIR``, but with
+    ``DEPOT_TOOLS_WIN_TOOLCHAIN=0`` V8 only looks for lower-case
+    ``vsYYYY_install`` variables. Without this mapping, ``gn gen`` fails with
+    "No supported Visual Studio can be found" even though VS is installed.
+    """
+    if os.name != "nt":
+        return
+
+    install_dir = os.environ.get("VSINSTALLDIR", "").rstrip("\\/")
+    if not install_dir:
+        return
+
+    year = os.path.basename(os.path.dirname(install_dir))
+    if year in ("2022", "2019", "2017"):
+        os.environ.setdefault("vs{}_install".format(year), install_dir)
+
+
+_export_visual_studio_install()
+
+# Use the platform's PATH separator (':' on POSIX, ';' on Windows). A hard-coded
+# ':' makes depot_tools unreachable from Windows subprocesses.
+os.environ["PATH"] = os.pathsep.join(
+    part for part in (os.environ.get("PATH", ""), DEPOT_HOME) if part
+)
 
 ICU_DATA_FOLDER_UNIX = "/usr/share/stpyv8"
 ICU_DATA_FOLDER_OSX = "/Library/Application Support/STPyV8/"
@@ -29,14 +73,24 @@ if os.name in ("posix",):
 else:
     icu_data_folder = None
 
-os.environ["PATH"] = f"{os.environ['PATH']}:{DEPOT_HOME}"
-
 gn_args = {
-    "dcheck_always_on": "true" if os.environ.get("STPYV8_DEBUG") else "false",
+    "dcheck_always_on": "false",
     "is_component_build": "false",
     "is_debug": "true" if os.environ.get("STPYV8_DEBUG") else "false",
     "treat_warnings_as_errors": "false",
-    "use_custom_libcxx": "false",
+    # On Windows the STPyV8 extension is compiled with MSVC and the MSVC STL,
+    # while V8's bundled libc++ uses the `std::__Cr` inline namespace. Any V8
+    # API whose signature contains an STL type (e.g.
+    # v8::Message::PrintCurrentStackTrace(isolate, std::ostream&) or
+    # v8::platform::NewDefaultPlatform -> std::unique_ptr) then has a different
+    # mangled name in V8 than in the extension, so linking fails. Build V8
+    # against the MSVC STL on Windows to keep both sides ABI-compatible.
+    # On Linux V8 is built against libc++ by default, but the STPyV8 extension is
+    # compiled with the system gcc/libstdc++. Mixing the two STLs yields undefined
+    # libc++ symbols (std::__Cr::__shared_weak_count) when the extension is loaded,
+    # so build V8 against libstdc++ on Linux as well. macOS keeps libc++ (required
+    # there) and Windows keeps the MSVC STL.
+    "use_custom_libcxx": "false" if platform.system() in ("Linux", "Windows") else "true",
     "v8_deprecation_warnings": "true",
     "v8_enable_disassembler": "false",
     "v8_enable_i18n_support": "true",
@@ -47,8 +101,6 @@ gn_args = {
     "v8_use_external_startup_data": "false",
 }
 
-GN_ARGS = " ".join(f"{key}={value}" for key, value in gn_args.items())
-
 source_files = [
     "Exception.cpp",
     "Platform.cpp",
@@ -58,28 +110,30 @@ source_files = [
     "Wrapper.cpp",
     "Locker.cpp",
     "Utils.cpp",
+    "CrashHandler.cpp",
     "STPyV8.cpp",
 ]
 
 
-macros = [("BOOST_PYTHON_STATIC_LIB", None)]
-include_dirs = [BOOST_ROOT]
-library_dirs = [os.path.join(BOOST_ROOT, "stage", "lib")]
+macros = [
+    ("BOOST_PYTHON_STATIC_LIB", None),
+    # Our Boost build uses the "system" library layout (boost_python312.lib),
+    # which does not match the versioned name Boost auto-link derives from the
+    # compiler flags. Disable auto-linking so the explicitly listed library is
+    # used instead.
+    ("BOOST_ALL_NO_LIB", None),
+]
+include_dirs = set()
+library_dirs = set()
 libraries = []
 extra_compile_args = []
 extra_link_args = []
-if sys.platform == "linux":
-    extra_link_args += [
-        "-L/usr/lib/x86_64-linux-gnu",
-        "-l:libstdc++.a",
-        "-l:libboost_system.a",
-        "-l:libboost_iostreams.a",
-        f"-l:libboost_python{sys.version_info[0]}{sys.version_info[1]}.a",
-        "-l:libv8_monolith.a",
-    ]
 
-include_dirs.append(os.path.join(V8_HOME, "include"))
-library_dirs.append(os.path.join(V8_HOME, "out.gn/x64.release.sample/obj/"))
+include_dirs.add(os.path.join(V8_HOME, "include"))
+library_dirs.add(
+    os.path.join(V8_HOME, os.path.join("out.gn", "x64.release.sample", "obj"))
+)
+
 
 BOOST_PYTHON_LIB_SHORT = f"boost_python{sys.version_info.major}"
 BOOST_PYTHON_LIB_LONG = f"boost_python{sys.version_info.major}{sys.version_info.minor}"
@@ -127,18 +181,95 @@ STPYV8_BOOST_PYTHON = os.getenv(
 )
 
 if os.name in ("nt",):
-    os.environ["DEPOT_TOOLS_WIN_TOOLCHAIN"] = "0"
-    if os.environ.get("INCLUDE"):
-        include_dirs += os.environ["INCLUDE"].split(";")
-    if os.environ.get("LIB"):
-        library_dirs += os.environ["LIB"].split(";")
-    libraries += ["winmm", "ws2_32", "advapi32", "dbghelp", "v8_monolith"]
-    extra_compile_args += ["/O2", "/GL", "/MT", "/EHsc", "/Gy", "/Zi", "/std:c++17"]
+    include_dirs.add(os.path.join(V8_HOME, "include"))
+    library_dirs.add(os.path.join(V8_HOME, "out.gn", "x64.release.sample", "obj"))
+
+    if "BOOST_ROOT" in os.environ:
+        include_dirs.add(os.environ.get("BOOST_ROOT"))
+        library_dirs.add(os.path.join(os.environ["BOOST_ROOT"], "stage", "lib"))
+
+    if "Python_ROOT_DIR" in os.environ:
+        include_dirs.add(os.path.join(os.environ["Python_ROOT_DIR"], "include"))
+        library_dirs.add(os.path.join(os.environ["Python_ROOT_DIR"], "libs"))
+
+    if "INCLUDE" in os.environ:
+        for p in os.environ["INCLUDE"].split(";"):
+            include_dirs.add(p)
+    if "LIB" in os.environ:
+        for p in os.environ["LIB"].split(";"):
+            library_dirs.add(p)
+
+    libraries += [
+        "winmm",
+        "ws2_32",
+        "Advapi32",
+        "dbghelp",
+        "v8_monolith",
+        BOOST_PYTHON_LIB_LONG,
+        # Boost components used by the extension (Exception.cpp uses
+        # boost::iostreams, Platform.cpp uses boost::filesystem). Auto-linking is
+        # disabled via BOOST_ALL_NO_LIB, so they must be listed explicitly.
+        # Built with `--layout=system` so the names carry no compiler-version tag.
+        "libboost_iostreams",
+        "libboost_filesystem",
+    ]
+    extra_compile_args += ["/O2", "/GL", "/MT", "/EHsc", "/Gy", "/Zi", "/std:c++20", "/Zc:__cplusplus"]
     extra_link_args += ["/DLL", "/OPT:REF", "/OPT:ICF", "/MACHINE:X64"]
+    if os.environ.get("STPYV8_PDB"):
+        # Emit a PDB so native crashes can be symbolized in WinDbg. This is
+        # independent of V8's build flavor: the extension stays a release (/MT)
+        # build linked against the release v8_monolith, and only gains symbols.
+        # (Do NOT gate this on STPYV8_DEBUG -- a debug V8 pulls in the debug CRT
+        # (_malloc_dbg/_CrtDbgReport/...) which the release extension can't link.)
+        extra_link_args += ["/DEBUG"]
+    macros += [
+        ("HAVE_SNPRINTF", None),
+    ]
+
+    os.environ["DEPOT_TOOLS_WIN_TOOLCHAIN"] = "0"
+
 elif os.name in ("posix",):
-    if sys.platform == "darwin":
-        libraries = ["boost_system", "boost_iostreams", "v8_monolith", STPYV8_BOOST_PYTHON]
-    extra_compile_args.append("-std=c++17")
+    libraries = [
+        "boost_system",
+        "boost_iostreams",
+        "boost_filesystem",
+        "v8_monolith",
+        STPYV8_BOOST_PYTHON.replace(".", ""),
+    ]
+
+    extra_compile_args.append("-Wno-strict-aliasing")
+    extra_compile_args.append("-Wno-array-bounds")
 
     if platform.system() in ("Linux",):
         libraries.append("rt")
+        extra_compile_args.append("-std=c++2a")
+        # Do NOT statically link libstdc++ (-static-libstdc++). As a Python
+        # extension the .so is loaded into a process that already links
+        # libstdc++.so.6 dynamically (CPython and other extensions). A statically
+        # bundled libstdc++ then coexists with the dynamic one and their global
+        # std::locale / iostream state diverges -- which crashes inside
+        # v8::V8::Initialize (FlagList::Hash serializes flags through an
+        # ostringstream, reaching std::codecvt::do_unshift -> SIGSEGV). Link
+        # libstdc++ dynamically so the extension, V8 and the host share one
+        # runtime. (Older-distro support must come from building with an older
+        # GCC / manylinux, NOT from -static-libstdc++.)
+
+        # NOTE: We intentionally do NOT pass --sysroot=<v8 sysroot> to the
+        # extension build. Debian/Ubuntu split the Python headers and
+        # /usr/include/pythonX.Y/pyconfig.h does
+        #     #include <x86_64-linux-gnu/pythonX.Y/pyconfig.h>
+        # which only exists under the real /usr/include (shipped by
+        # libpythonX.Y-dev), NOT inside V8's sysroot. Under --sysroot that
+        # angle-bracket include fails with a pyconfig.h "No such file" error
+        # (verified). V8 itself is already compiled against the sysroot
+        # (glibc 2.31); we let the extension/Boost build against the host glibc
+        # and verify the resulting .so's real floor with `readelf -V`.
+    else:
+        extra_compile_args.append("-std=c++20")
+        extra_link_args.append("-headerpad_max_install_names")
+
+
+GN_ARGS = " ".join(f"{key}={value}" for key, value in gn_args.items())
+
+include_dirs = list(include_dirs)
+library_dirs = list(library_dirs)

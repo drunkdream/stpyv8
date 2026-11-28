@@ -1,0 +1,276 @@
+---
+name: Windows build/release workflow
+on:
+  push:
+  pull_request:
+  release:
+    types: [published]
+    branches: [master]
+env:
+  BOOST_ROOT: boost
+  MSVC_TOOLSET_VERSION: 14.2
+  V8_HOME: ${{ github.workspace }}/v8
+  DEPOT_HOME: ${{ github.workspace }}/depot_tools
+jobs:
+  build-v8:
+    # If Google V8 is in the workflow cache, don't build it.
+    # Cloning the repository is still necessary in any case
+    # to calculate the hash for the cache key
+    name: Build Google V8
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-2022]
+    outputs:
+      v8-hash: ${{ steps.v8-hash.outputs.v8-hash }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Clone Google V8
+        run: |
+          python -m pip install setuptools wheel
+          echo "::group::Clone v8"
+          python setup.py checkout_v8
+          echo "::endgroup::"
+      - name: Compute V8 hash
+        id: v8-hash
+        shell: bash
+        run: echo "v8-hash=${{ hashFiles('v8/src/**') }}" >> "$GITHUB_OUTPUT"
+      - name: Restore Google V8 from cache
+        id: restore-v8
+        uses: actions/cache/restore@main
+        with:
+          path: |
+            v8\out.gn\x64.release.sample\obj\v8_monolith.lib
+            v8\out.gn\x64.release.sample\icudtl.dat
+            v8\include
+          key: windows-build-v8-${{ matrix.os }}-${{ hashFiles('v8/src/**') }}
+      - name: Initialize MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        if: ${{ steps.restore-v8.outputs.cache-hit != 'true' }}
+        with:
+          toolset: 14.2
+      - name: Export VS install path for depot_tools
+        if: ${{ steps.restore-v8.outputs.cache-hit != 'true' }}
+        shell: pwsh
+        run: |
+          $vsWhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsInstall = & $vsWhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+
+          if (-not $vsInstall) {
+            $vsInstall = Join-Path $env:ProgramFiles 'Microsoft Visual Studio\2022\Enterprise'
+          }
+
+          if (-not (Test-Path $vsInstall)) {
+            throw "Visual Studio installation not found at $vsInstall"
+          }
+
+          Add-Content -Path $env:GITHUB_ENV -Value "vs2022_install=$vsInstall"
+          Add-Content -Path $env:GITHUB_ENV -Value "GYP_MSVS_OVERRIDE_PATH=$vsInstall"
+      - name: Build Google V8
+        id: build-v8
+        if: ${{ steps.restore-v8.outputs.cache-hit != 'true' }}
+        continue-on-error: false
+        run: |
+          python -m pip install setuptools wheel
+          echo "::group::v8"
+          python build.py --v8-only --skip-v8-sync
+          echo "::endgroup::"
+      - name: Save Google V8 to cache
+        uses: actions/cache/save@main
+        if: ${{ steps.restore-v8.outputs.cache-hit != 'true' }}
+        with:
+          # Save compiled binary and header files. This will save an
+          # additional clone of Google V8 for the linker
+          path: |
+            v8\out.gn\x64.release.sample\obj\v8_monolith.lib
+            v8\out.gn\x64.release.sample\icudtl.dat
+            v8\include
+          key: windows-build-v8-${{ matrix.os }}-${{ hashFiles('v8/src/**') }}
+  build:
+    name: Build Windows wheel (Python ${{ matrix.python-version }})
+    needs: build-v8
+    runs-on: ${{ matrix.os }}
+    env:
+      DIST_NAME: stpyv8-windows-py${{ matrix.python-version }}
+    strategy:
+      matrix:
+        os: [windows-2022]
+        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        id: install-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Resolve Boost version from settings.py
+        id: boost_version
+        shell: bash
+        run: |
+          echo "version=$(python -c 'import settings; print(settings.BOOST_VERSION)')" >> "$GITHUB_OUTPUT"
+          echo "snake=$(python -c 'import settings; print(settings.BOOST_VERSION_SNAKE)')" >> "$GITHUB_OUTPUT"
+      - name: Restore Boost from cache
+        id: restore-boost
+        uses: actions/cache/restore@main
+        with:
+          path: ${{ env.BOOST_ROOT }}\stage\lib
+          key: boost-${{ matrix.os }}-${{ steps.boost_version.outputs.version }}-python${{ matrix.python-version }}-vc142-x64-system
+      - name: Initialize MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        if: ${{ steps.restore-boost.outputs.cache-hit != 'true' }}
+        with:
+          toolset: ${{ env.MSVC_TOOLSET_VERSION }}
+      - name: Download Boost
+        if: ${{ steps.restore-boost.outputs.cache-hit != 'true' }}
+        id: download-boost
+        uses: suisei-cn/actions-download-file@v1.6.0
+        with:
+          url: https://archives.boost.io/release/${{ steps.boost_version.outputs.version }}/source/boost_${{ steps.boost_version.outputs.snake }}.zip
+      - name: Install Boost
+        if: ${{ steps.restore-boost.outputs.cache-hit != 'true' }}
+        id: install-boost
+        run: |
+          mkdir $env:BOOST_ROOT
+          Expand-Archive ${{ steps.download-boost.outputs.filename }} -DestinationPath $env:BOOST_ROOT
+          cd $env:BOOST_ROOT\*
+          echo "BOOST_ROOT=$pwd" >> $env:GITHUB_OUTPUT
+          echo "BOOST_ROOT=$pwd" >> $env:GITHUB_ENV
+          echo "BOOST_LIBRARYDIR=$pwd\stage\lib" >> $env:GITHUB_ENV
+      - name: Build Boost
+        if: ${{ steps.restore-boost.outputs.cache-hit != 'true' }}
+        working-directory: ${{ steps.install-boost.outputs.BOOST_ROOT }}
+        run: |
+          # Boost 1.89 ships b2 5.3.2, which cannot auto-detect VS2026 and
+          # reports "Unknown toolset: vcunk". vcvarsall was already invoked
+          # with toolset 14.2 above, so select vc142 explicitly here; this
+          # also writes `using msvc : 14.2 ;` into project-config.jam.
+          .\bootstrap.bat vc142
+          if ($LASTEXITCODE -ne 0) {
+            if (Test-Path bootstrap.log) { Get-Content bootstrap.log }
+            throw "Boost bootstrap failed with exit code $LASTEXITCODE"
+          }
+
+          # Set specific Python version
+          $escapedPythonPath = "${{ steps.install-python.outputs.python-path }}" -Replace "\\","\\"
+          echo "using python : : ""$escapedPythonPath"" ;" >> project-config.jam
+
+          # Patch bug affecting compilation on Python 3.10
+          # https://github.com/boostorg/python/commit/cbd2d9f033c61d29d0a1df14951f4ec91e7d05cd
+          (Get-Content libs\python\src\exec.cpp).replace('_Py_fopen', 'fopen') | Set-Content libs\python\src\exec.cpp
+          # settings.py links system-layout names. Build the same variant the
+          # extension uses: 64-bit, release, static Boost and static CRT.
+          # Without address-model=64 b2 can emit 32-bit libraries, whose decorated
+          # C++ symbols do not match the x64 extension and cause mass LNK2001s.
+          .\b2.exe stage -j 8 toolset=msvc-14.2 link=static runtime-link=static variant=release address-model=64 --layout=system --with-python --with-filesystem --with-iostreams --with-date_time --with-thread
+          if ($LASTEXITCODE -ne 0) { throw "Boost build failed with exit code $LASTEXITCODE" }
+
+          # Static libraries use the `lib` prefix on Windows; settings.py wants
+          # the unprefixed Boost.Python name. Overwrite any same-named import lib.
+          $pyTag = '${{ matrix.python-version }}' -replace '\.', ''
+          $boostPython = "boost_python$pyTag.lib"
+          $prefixedPython = "lib$boostPython"
+          if (-not (Test-Path "stage\lib\$prefixedPython")) {
+            throw "Static Boost.Python library missing: $prefixedPython"
+          }
+          Copy-Item "stage\lib\$prefixedPython" "stage\lib\$boostPython" -Force
+
+          foreach ($lib in @($boostPython, 'libboost_iostreams.lib', 'libboost_filesystem.lib')) {
+            if (-not (Test-Path "stage\lib\$lib")) {
+              throw "Boost library missing after build: $lib"
+            }
+          }
+          ls stage\lib
+      - name: Save Boost to cache
+        uses: actions/cache/save@main
+        if: ${{ steps.restore-boost.outputs.cache-hit != 'true' }}
+        with:
+          path: ${{ steps.install-boost.outputs.BOOST_ROOT }}\stage\lib
+          key: boost-${{ matrix.os }}-${{ steps.boost_version.outputs.version }}-python${{ matrix.python-version }}-vc142-x64-system
+      - name: Restore Google V8 from cache
+        id: restore-v8
+        uses: actions/cache/restore@main
+        with:
+          path: |
+            v8\out.gn\x64.release.sample\obj\v8_monolith.lib
+            v8\out.gn\x64.release.sample\icudtl.dat
+            v8\include
+          key: windows-build-v8-${{ matrix.os }}-${{ needs.build-v8.outputs.v8-hash }}
+      - name: Build wheel
+        env:
+          # Emit a PDB for symbolized native crash stacks. setup.py strips it from
+          # the wheel, but the .pyd still embeds its path for dbghelp.
+          STPYV8_PDB: 1
+          # Set include and library files which will be picked up by setuptools
+          INCLUDE: ${{ env.INCLUDE }};${{ steps.install-python.outputs.python-path
+            }}include
+        run: |
+          python -m pip install setuptools wheel delvewheel importlib_resources pytest pytest-order
+
+          # Google V8 build should already be supplied from cache hence no need to rebuild
+          python setup.py sdist bdist_wheel --skip-build-v8 -d wheelhouse-${{ env.DIST_NAME }}
+          if (-not $?) {
+            echo "::error::Wheel build failed"
+            exit 1
+          }
+      - name: Repair wheel
+        run: |
+          Get-ChildItem -Path wheelhouse-${{ env.DIST_NAME }} -Filter *.whl | Foreach-Object {
+            delvewheel repair -vv -w ${{ env.DIST_NAME }} $_.FullName
+          }
+      - name: Install wheel
+        run: |
+          python -m pip install --find-links=${{ env.DIST_NAME }} stpyv8
+          if (-not $?) {
+            echo "::error::Wheel installation failed"
+            exit 1
+          }
+      - name: Test wheel
+        env:
+          # Install the crash filter so native stacks are printed to stderr.
+          STPYV8_CRASH_DUMP: ${{ github.workspace }}/crashes
+        run: |
+          New-Item -ItemType Directory -Force -Path crashes | Out-Null
+          pytest -v
+      - name: Upload crash stacks
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stpyv8-crashes-${{ matrix.os }}-python${{ matrix.python-version }}
+          path: crashes/*
+          if-no-files-found: ignore
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: stpyv8-${{ matrix.os }}-python${{ matrix.python-version }}
+          path: ${{ env.DIST_NAME }}/*.whl
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        if: ${{ github.event_name == 'release' }}
+        with:
+          files: ${{ env.DIST_NAME }}/*.whl
+          token: ${{ secrets.GITHUB_TOKEN }}
+  pypi-publish:
+    name: Upload release to PyPI
+    if: ${{ github.event_name == 'release' }}
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/stpyv8
+    permissions:
+      id-token: write
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          path: stpyv8-windows-dist
+          pattern: stpyv8-windows*
+          merge-multiple: true
+      - name: Publish wheels to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: stpyv8-windows-dist

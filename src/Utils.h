@@ -44,6 +44,7 @@ inline bool isfinite(double val) {
 #endif // _WIN32
 
 #if defined(__APPLE__) && !defined(isalnum)
+#undef LONG_BIT
 #include <pyport.h>
 #undef isalnum
 #undef isalpha
@@ -58,6 +59,8 @@ inline bool isfinite(double val) {
 #  undef TIME_UTC
 # endif
 
+#include <v8.h>
+
 #include <boost/python.hpp>
 namespace py = boost::python;
 
@@ -70,8 +73,6 @@ namespace py = boost::python;
 #undef COMPILER
 #undef snprintf
 #endif
-
-#include <v8.h>
 
 #ifdef _WIN32
 #ifdef DEBUG
@@ -90,11 +91,6 @@ namespace py = boost::python;
 #define PyInt_Check               PyLong_Check
 #define PyInt_AsUnsignedLongMask  PyLong_AsUnsignedLong
 #define PySlice_Cast(obj) obj
-#ifdef Py_DEBUG
-#define PyErr_OCCURRED() PyErr_Occurred()
-#else
-#define PyErr_OCCURRED() (PyThreadState_GET()->curexc_type)
-#endif
 
 v8::Handle<v8::String> ToString(const std::string& str);
 v8::Handle<v8::String> ToString(const std::wstring& str);

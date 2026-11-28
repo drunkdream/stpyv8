@@ -4,6 +4,74 @@
 
 #include "libplatform/libplatform.h"
 
+namespace
+{
+// Scope needed by every CContext entry point that touches V8. It re-enters the
+// context owned by this wrapper, so a Python callback invoked outside `with
+// v8.JSContext(...)` can still call ctx.eval() safely. When no Locker is held
+// (e.g. after JSContext.__exit__ released it), acquire one with the GIL
+// dropped to avoid deadlocking against another V8 thread.
+std::unique_ptr<v8::Locker> AcquireLocker(v8::Isolate *isolate)
+{
+    if (v8::Locker::IsLocked(isolate))
+        return nullptr;
+
+    std::unique_ptr<v8::Locker> locker;
+
+    Py_BEGIN_ALLOW_THREADS
+    locker.reset(new v8::Locker(isolate));
+    Py_END_ALLOW_THREADS
+
+    return locker;
+}
+
+std::unique_ptr<v8::Isolate::Scope> AcquireIsolateScope(v8::Isolate *isolate,
+                                                        bool acquired_locker)
+{
+    // Isolate::Enter() resets V8's stack start/limit to the current C stack
+    // pointer. Re-entering while already inside a context (e.g. every
+    // ctx.eval() within `with ctx`) would keep moving that limit and can crash
+    // on stack-constrained platforms, so skip that common path.
+    //
+    // A callback may hold a JSContext after `with` has exited. The context is
+    // then no longer current, so we must rebuild the isolate entry state even
+    // though Isolate::GetCurrent() still points at the same isolate. The same
+    // applies when this call acquired a fresh Locker: V8 may have freed the
+    // thread state when the previous Locker was released.
+    if (!acquired_locker && v8::Isolate::GetCurrent() == isolate &&
+            isolate->InContext())
+        return nullptr;
+
+    return std::unique_ptr<v8::Isolate::Scope>(new v8::Isolate::Scope(isolate));
+}
+
+class ContextScopeGuard
+{
+    // Declared first so it is constructed before the V8 scopes below.
+    std::unique_ptr<v8::Locker> m_locker;
+    std::unique_ptr<v8::Isolate::Scope> m_isolate_scope;
+    v8::HandleScope m_handle_scope;
+    v8::Context::Scope m_context_scope;
+public:
+    ContextScopeGuard(v8::Isolate *isolate,
+                      const v8::Persistent<v8::Context>& context)
+        : m_locker(AcquireLocker(isolate)),
+          m_isolate_scope(AcquireIsolateScope(isolate, m_locker != nullptr)),
+          m_handle_scope(isolate),
+          m_context_scope(v8::Local<v8::Context>::New(isolate, context))
+    {
+    }
+};
+
+void CheckContextAlive(v8::Isolate *isolate,
+                       const v8::Persistent<v8::Context>& context)
+{
+    if (isolate == nullptr || !IsolateRegistry::IsAlive(isolate) ||
+            context.IsEmpty())
+        throw std::runtime_error("JavaScript context is no longer alive");
+}
+}
+
 void CContext::Expose(void)
 {
     py::class_<CPlatform, boost::noncopyable>("JSPlatform", "JSPlatform allows the V8 platform to be initialized", py::no_init)
@@ -29,6 +97,24 @@ void CContext::Expose(void)
     .def("leave", &CIsolate::Leave,
          "Exits this isolate by restoring the previously entered one in the current thread. "
          "The isolate may still stay the same, if it was entered more than once.")
+
+    .add_static_property("pendingRejections", &CIsolate::GetPendingRejections,
+                         "Unhandled promise rejections seen on this isolate, oldest first. "
+                         "Each entry is a dict with 'message', 'stack' and 'description'. "
+                         "Use clearPendingRejections() once they have been reported.")
+
+    .def("clearPendingRejections", &CIsolate::ClearPendingRejections,
+         "Forget the unhandled promise rejections recorded for this isolate.")
+    .staticmethod("clearPendingRejections")
+
+    .def("lowMemory", &CIsolate::LowMemory,
+         "Notify the isolate that the system is low on memory, forcing a "
+         "collection now.")
+
+    .def("runMicrotasks", &CIsolate::RunMicrotasks,
+         "Run the microtask queue of the current isolate to completion, so a promise "
+         "chain started by eval() actually progresses.")
+    .staticmethod("runMicrotasks")
     ;
 
     py::class_<CContext, boost::noncopyable>("JSContext", "JSContext is an execution context.", py::no_init)
@@ -81,29 +167,52 @@ void CContext::Expose(void)
     py::objects::pointer_holder<std::shared_ptr<CContext>,CContext> > >();
 }
 
-CContext::CContext(v8::Handle<v8::Context> context)
+CContext::CContext(v8::Isolate* isolate, v8::Handle<v8::Context> context)
+    : m_isolate(isolate), m_owner(false)
 {
-    v8::HandleScope handle_scope(v8::Isolate::GetCurrent());
+    v8::HandleScope handle_scope(isolate);
 
-    m_context.Reset(context->GetIsolate(), context);
+    m_context.Reset(isolate, context);
+    m_contextId = context->Global()->GetIdentityHash();
 }
 
 CContext::CContext(const CContext& context)
+    : m_global(context.m_global), m_isolate(v8::Isolate::GetCurrent()), m_owner(true)
 {
-    v8::HandleScope handle_scope(v8::Isolate::GetCurrent());
+    v8::Isolate* isolate = m_isolate;
+    v8::HandleScope handle_scope(isolate);
 
-    m_context.Reset(context.Handle()->GetIsolate(), context.Handle());
+    // "Create a new context based on an existing context": build a fresh
+    // context in the *current* isolate, reusing the same global object.
+    // The previous implementation only created another Persistent onto the very
+    // same v8::Context, which is invalid as soon as the current isolate is not
+    // the one owning it (e.g. `JSContext(g)` inside a `JSIsolate()` block on
+    // another thread) and corrupts V8 state for later isolates.
+    v8::Handle<v8::Context> new_context = v8::Context::New(isolate);
+
+    m_context.Reset(isolate, new_context);
+    m_contextId = new_context->Global()->GetIdentityHash();
+
+    v8::Context::Scope context_scope(Handle());
+
+    if (!m_global.is_none())
+    {
+        Handle()->Global()->Set(new_context,
+                                v8::String::NewFromUtf8(isolate, "__proto__").ToLocalChecked(),
+                                CPythonObject::Wrap(m_global));
+    }
 }
 
 CContext::CContext(py::object global)
-    : m_global(global)
+    : m_global(global), m_isolate(v8::Isolate::GetCurrent()), m_owner(true)
 {
-    v8::Isolate* isolate = v8::Isolate::GetCurrent();
+    v8::Isolate* isolate = m_isolate;
     v8::HandleScope handle_scope(isolate);
 
     v8::Handle<v8::Context> context = v8::Context::New(isolate);
 
     m_context.Reset(isolate, context);
+    m_contextId = context->Global()->GetIdentityHash();
 
     v8::Context::Scope context_scope(Handle());
 
@@ -116,8 +225,6 @@ CContext::CContext(py::object global)
         if(retcode.IsNothing()) {
             //TODO we need to do something if the set call failed
         }
-
-        Py_DECREF(global.ptr());
     }
 }
 
@@ -161,41 +268,56 @@ void CContext::SetSecurityToken(py::str token)
 py::object CContext::GetEntered(void)
 {
     v8::Isolate* isolate = v8::Isolate::GetCurrent();
+
+    if (!isolate->InContext())
+        return py::object();
+
     v8::HandleScope handle_scope(isolate);
 
     v8::Handle<v8::Context> entered = isolate->GetEnteredOrMicrotaskContext();
 
-    return (!isolate->InContext() || entered.IsEmpty()) ? py::object() :
-           py::object(py::handle<>(boost::python::converter::shared_ptr_to_python<CContext>(CContextPtr(new CContext(entered)))));
+    return (entered.IsEmpty()) ? py::object() :
+           py::object(py::handle<>(boost::python::converter::shared_ptr_to_python<CContext>(CContextPtr(new CContext(isolate, entered)))));
 }
 
 py::object CContext::GetCurrent(void)
 {
     v8::Isolate* isolate = v8::Isolate::GetCurrent();
+    if (!isolate->InContext())
+        return py::object();
+
     v8::HandleScope handle_scope(isolate);
 
     v8::Handle<v8::Context> current = isolate->GetCurrentContext();
 
     return (current.IsEmpty()) ? py::object() :
-           py::object(py::handle<>(boost::python::converter::shared_ptr_to_python<CContext>(CContextPtr(new CContext(current)))));
+           py::object(py::handle<>(boost::python::converter::shared_ptr_to_python<CContext>(CContextPtr(new CContext(isolate, current)))));
 }
 
 py::object CContext::GetCalling(void)
 {
     v8::Isolate* isolate = v8::Isolate::GetCurrent();
+
+    if (!isolate->InContext())
+        return py::object();
+
     v8::HandleScope handle_scope(isolate);
 
     v8::Handle<v8::Context> calling = isolate->GetCurrentContext();
 
-    return (!isolate->InContext() || calling.IsEmpty()) ? py::object() :
-           py::object(py::handle<>(boost::python::converter::shared_ptr_to_python<CContext>(CContextPtr(new CContext(calling)))));
+    return (calling.IsEmpty()) ? py::object() :
+           py::object(py::handle<>(boost::python::converter::shared_ptr_to_python<CContext>(CContextPtr(new CContext(isolate, calling)))));
 }
 
 py::object CContext::Evaluate(const std::string& src,
                               const std::string name,
                               int line, int col)
 {
-    CEngine engine(v8::Isolate::GetCurrent());
+    CheckContextAlive(m_isolate, m_context);
+
+    ContextScopeGuard scope(m_isolate, m_context);
+
+    CEngine engine(m_isolate);
 
     CScriptPtr script = engine.Compile(src, name, line, col);
 
@@ -203,10 +325,14 @@ py::object CContext::Evaluate(const std::string& src,
 }
 
 py::object CContext::EvaluateW(const std::wstring& src,
-                               const std::wstring name,
-                               int line, int col)
+                              const std::wstring name,
+                              int line, int col)
 {
-    CEngine engine(v8::Isolate::GetCurrent());
+    CheckContextAlive(m_isolate, m_context);
+
+    ContextScopeGuard scope(m_isolate, m_context);
+
+    CEngine engine(m_isolate);
 
     CScriptPtr script = engine.CompileW(src, name, line, col);
 
