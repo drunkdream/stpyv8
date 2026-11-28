@@ -53,6 +53,39 @@ std::string Timestamp()
 
 #ifdef _WIN32
 
+// Only crash-worthy exceptions; ignore first-chance C++ / SEH exceptions that
+// are handled normally (0xe06d7363 et al).
+bool IsFatalException(DWORD code)
+{
+    switch (code)
+    {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_BREAKPOINT:
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+    case EXCEPTION_DATATYPE_MISALIGNMENT:
+    case EXCEPTION_FLT_DENORMAL_OPERAND:
+    case EXCEPTION_FLT_DIVIDE_BY_ZERO:
+    case EXCEPTION_FLT_INEXACT_RESULT:
+    case EXCEPTION_FLT_INVALID_OPERATION:
+    case EXCEPTION_FLT_OVERFLOW:
+    case EXCEPTION_FLT_STACK_CHECK:
+    case EXCEPTION_FLT_UNDERFLOW:
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_IN_PAGE_ERROR:
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case EXCEPTION_INT_OVERFLOW:
+    case EXCEPTION_INVALID_DISPOSITION:
+    case EXCEPTION_NONCONTINUABLE_EXCEPTION:
+    case EXCEPTION_PRIV_INSTRUCTION:
+    case EXCEPTION_STACK_OVERFLOW:
+        return true;
+    default:
+        return false;
+    }
+}
+
+volatile LONG s_crashed = 0;
+
 void PrintNativeStack(EXCEPTION_POINTERS *info)
 {
     HANDLE process = ::GetCurrentProcess();
@@ -88,31 +121,54 @@ void PrintNativeStack(EXCEPTION_POINTERS *info)
     std::fflush(stderr);
 }
 
-LONG WINAPI CrashExceptionFilter(EXCEPTION_POINTERS *info)
+void WriteMiniDump(EXCEPTION_POINTERS *info)
 {
     std::string path = CrashDumpDir() + "\\stpyv8-crash-" + Timestamp() + "-" +
                        std::to_string(::GetCurrentProcessId()) + ".dmp";
 
     HANDLE file = ::CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr,
                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file != INVALID_HANDLE_VALUE)
-    {
-        MINIDUMP_EXCEPTION_INFORMATION mei;
-        mei.ThreadId = ::GetCurrentThreadId();
-        mei.ExceptionPointers = info;
-        mei.ClientPointers = FALSE;
+    if (file == INVALID_HANDLE_VALUE)
+        return;
 
-        ::MiniDumpWriteDump(::GetCurrentProcess(), ::GetCurrentProcessId(), file,
-                            static_cast<MINIDUMP_TYPE>(MiniDumpWithDataSegs |
-                                                       MiniDumpWithHandleData),
-                            info ? &mei : nullptr, nullptr, nullptr);
-        ::CloseHandle(file);
-    }
+    MINIDUMP_EXCEPTION_INFORMATION mei;
+    mei.ThreadId = ::GetCurrentThreadId();
+    mei.ExceptionPointers = info;
+    mei.ClientPointers = FALSE;
 
+    ::MiniDumpWriteDump(::GetCurrentProcess(), ::GetCurrentProcessId(), file,
+                        static_cast<MINIDUMP_TYPE>(MiniDumpWithDataSegs |
+                                                   MiniDumpWithHandleData),
+                        info ? &mei : nullptr, nullptr, nullptr);
+    ::CloseHandle(file);
+}
+
+LONG CALLBACK VectoredExceptionHandler(PEXCEPTION_POINTERS info)
+{
+    if (!info || !info->ExceptionRecord ||
+            !IsFatalException(info->ExceptionRecord->ExceptionCode))
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    if (::InterlockedCompareExchange(&s_crashed, 1, 0) != 0)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    WriteMiniDump(info);
     PrintNativeStack(info);
 
-    // Continue searching so WER / a debugger still handle the crash and the
-    // process terminates as usual.
+    // Continue the normal SEH chain so Python's faulthandler can still print
+    // the Python stack and the process terminates as usual.
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+LONG WINAPI CrashExceptionFilter(EXCEPTION_POINTERS *info)
+{
+    // Fallback for exceptions that never reached the vectored handler.
+    if (::InterlockedCompareExchange(&s_crashed, 1, 0) == 0)
+    {
+        WriteMiniDump(info);
+        PrintNativeStack(info);
+    }
+
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -155,6 +211,9 @@ void InstallCrashHandler()
     ::SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES | SYMOPT_UNDNAME |
                     SYMOPT_FAIL_CRITICAL_ERRORS);
     ::SymInitialize(::GetCurrentProcess(), NULL, TRUE);
+    // VEH runs before every SEH handler (including pytest's faulthandler), so
+    // the native stack is printed even when Python terminates the process.
+    ::AddVectoredExceptionHandler(1, VectoredExceptionHandler);
     ::SetUnhandledExceptionFilter(&CrashExceptionFilter);
 #else
     struct sigaction sa;
